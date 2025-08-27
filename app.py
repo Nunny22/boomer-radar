@@ -1,4 +1,4 @@
-# app.py — Boomer Radar (polished UI + Boomer Score + Map + Outreach)
+# app.py — Boomer Radar (polished UI + Boomer Score + Map + Outreach + Accounts freshness)
 
 import math
 import urllib.parse as ul
@@ -13,16 +13,8 @@ st.set_page_config(page_title="Boomer Radar", page_icon="🎯", layout="wide")
 # --------- Global styles (fixed top padding so title isn't clipped) ----------
 st.markdown("""
 <style>
-/* Sidebar divider */
 section[data-testid="stSidebar"] { border-right: 1px solid #e9e9ef; }
-
-/* Give the main content breathing room so the title isn't clipped */
-.block-container {
-  padding-top: 2.4rem !important;
-  padding-bottom: 2rem;
-}
-
-/* KPI cards */
+.block-container { padding-top: 2.4rem !important; padding-bottom: 2rem; }
 .kpi { padding:12px 16px; border-radius:14px; background:#f7f7fb; border:1px solid #ececf2; }
 .kpi h3 { margin:0; font-size:1.8rem; line-height:1.1; }
 .kpi small { color:#667085; }
@@ -41,6 +33,13 @@ with st.sidebar:
     min_age = st.number_input("Minimum director age", min_value=50, max_value=90, value=55)
     max_directors = st.number_input("Max active directors", min_value=1, max_value=5, value=2)
     min_years_trading = st.slider("Min years trading", 0, 40, 10)
+
+    st.divider()
+    st.subheader("Accounts freshness")
+    require_recent = st.checkbox("Must have filed recently", value=False,
+                                 help="Keeps only companies whose 'last accounts made up to' date is recent.")
+    months_limit = st.slider("Max months since last accounts", 6, 36, 18, help="18 months ≈ CH filing window")
+    exclude_overdue = st.checkbox("Exclude overdue accounts", value=True)
 
     st.divider()
     st.subheader("Rate-limit safe")
@@ -93,20 +92,15 @@ def _norm(x, lo, hi):
     return (v - lo) / (hi - lo)
 
 def add_boomer_score(df: pd.DataFrame, radius_used: float | None):
-    # Build 0..1 components then combine with weights into 0..100 score
     dir_age = df["avg_director_age"].apply(lambda a: _norm(a, 55, 85))
-    # fallback PSC age to director age when not present
     psc_age = df["avg_psc_age"].where(df["avg_psc_age"].notna(), df["avg_director_age"]).apply(lambda a: _norm(a, 55, 85))
     years   = df["years_trading"].apply(lambda y: _norm(y, 5, 30))
     emps    = df["employees"].apply(lambda e: _norm(e, 1, 100))
     turn    = df["turnover"].apply(lambda t: _norm(t, 100_000, 5_000_000))
     if radius_used and "distance_km" in df.columns:
-        near = df["distance_km"].apply(
-            lambda d: None if pd.isna(d) else max(0.0, 1.0 - min(float(d)/float(radius_used), 1.0))
-        )
+        near = df["distance_km"].apply(lambda d: None if pd.isna(d) else max(0.0, 1.0 - min(float(d)/float(radius_used), 1.0)))
     else:
         near = pd.Series([None]*len(df))
-
     weights = [w_dir, w_psc, w_year, w_emp, w_turn, w_dist]
     parts   = [dir_age, psc_age, years, emps, turn, near]
     parts   = [p.fillna(0.0) for p in parts]
@@ -145,6 +139,8 @@ if run:
             fetch_financials=bool(fetch_financials), financials_top_n=int(financials_top_n),
             min_employees=int(min_employees), min_years_trading=int(min_years_trading),
             fetch_psc=bool(fetch_psc), psc_min_age=int(psc_min_age), psc_max_count=int(psc_max_count),
+            require_accounts_within_months=(int(months_limit) if require_recent else None),
+            exclude_overdue_accounts=bool(exclude_overdue),
         )
 
     # Radius filter (adds lat/lon) — or geocode all for map if no radius
@@ -182,8 +178,11 @@ if run:
 
         with t1:
             view_cols = [
-                "boomer_score","company_name","company_number","years_trading","avg_director_age",
-                "psc_count","employees","turnover","profit","postcode","distance_km",
+                "boomer_score","company_name","company_number",
+                "years_trading","avg_director_age","psc_count",
+                "employees","turnover","profit","postcode","distance_km",
+                # new accounts fields:
+                "last_accounts_made_up_to","months_since_accounts","accounts_overdue","next_accounts_due",
                 "ch_link","google","email_link"
             ]
             for c in view_cols:
@@ -199,6 +198,10 @@ if run:
                     "turnover":      st.column_config.NumberColumn("Turnover", format="£%0.0f"),
                     "profit":        st.column_config.NumberColumn("Profit",   format="£%0.0f"),
                     "distance_km":   st.column_config.NumberColumn("Km away",  format="%.1f"),
+                    "last_accounts_made_up_to": st.column_config.TextColumn("Last accounts (made up)"),
+                    "months_since_accounts": st.column_config.NumberColumn("Months since"),
+                    "accounts_overdue": st.column_config.TextColumn("Overdue?"),
+                    "next_accounts_due": st.column_config.TextColumn("Next due"),
                     "ch_link":       st.column_config.LinkColumn("Companies House", display_text="Open"),
                     "google":        st.column_config.LinkColumn("Google",          display_text="Search"),
                     "email_link":    st.column_config.LinkColumn("Email",           display_text="Compose"),
@@ -239,11 +242,14 @@ if run:
 
         with t3:
             st.markdown("""
-**How scoring works**
+**Accounts freshness filter**
 
-- Director age, PSC age, years trading, employees, turnover and nearness are scaled to 0..1  
-- Weighted by the sliders in the sidebar and combined into a **0–100 Boomer Score**  
-- Use the CSV for outreach; each row includes a ready-made email subject/body and a `mailto:` link.
+- Uses the company profile’s **`accounts.last_accounts.made_up_to`** date.
+- “Must have filed recently” keeps only companies whose last accounts were made up **within the selected months** (e.g., 12–18).
+- “Exclude overdue accounts” removes any company where CH marks the accounts as **overdue**.
 
-*Tip:* keep “Fetch turnover/profit” off for broad scans; switch on when you’re narrowing targets.
+**Boomer scoring**
+- Director age, PSC age, years trading, employees, turnover and nearness are scaled to 0..1, weighted, and combined to **0–100**.
+
+*Tip:* keep “Fetch turnover/profit” off for broad scans; switch on when narrowing targets.
             """)
