@@ -1,4 +1,5 @@
-# ch_retirement_finder.py — scoring helpers + geocoding + everything else
+# ch_retirement_finder.py — rate-limit safe + radius + turnover + PSC + employees
+# + trading age + geocoding + accounts freshness (last filed / overdue flags)
 
 import base64, datetime as dt, math, os, time
 from collections import deque
@@ -21,7 +22,7 @@ API_BASE = "https://api.company-information.service.gov.uk"
 DOC_BASE = "https://document-api.company-information.service.gov.uk"
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "CH-Boomer-Radar/0.7"})
+SESSION.headers.update({"User-Agent": "CH-Boomer-Radar/0.8"})
 
 # ---- throttle (stay under ~600 / 5 min) ----
 _WINDOW=300.0; _LIMIT=580; _REQ_TIMES:deque[float]=deque()
@@ -34,7 +35,6 @@ def _throttle():
     _REQ_TIMES.append(time.time())
 
 def _auth_header()->dict[str,str]:
-    import base64
     return {"Authorization": f"Basic {base64.b64encode(f'{API_KEY}:'.encode()).decode()}"}
 
 def _request(method:str,url:str,**kw)->requests.Response:
@@ -49,7 +49,7 @@ def ch_get(path:str, params:dict[str,Any]|None=None)->dict[str,Any]:
     r=_request("GET", f"{API_BASE}{path}", params=params)
     return {} if r.status_code==204 else r.json()
 
-# ---------- CH calls ----------
+# ---------- Companies House calls ----------
 
 def advanced_search_by_sic(sic_codes:list[str], size:int=100, start_index:int=0, company_status:str="active")->dict[str,Any]:
     return ch_get("/advanced-search/companies", {
@@ -85,11 +85,20 @@ def approx_age(dob:dict[str,int]|None)->int|None:
     t=dt.date.today()
     return t.year - y - (t.month < m)
 
-TURNOVER_TAGS=["Turnover","TurnoverRevenue","Revenue","Sales","RevenueFromContractWithCustomerExcludingAssessedTax","RevenueFromContractWithCustomerIncludingAssessedTax"]
-PROFIT_TAGS=["ProfitLoss","ProfitLossForPeriod","ProfitLossOnOrdinaryActivitiesBeforeTax","ProfitLossOnOrdinaryActivitiesAfterTax"]
-EMPLOYEE_TAGS=["AverageNumberEmployeesDuringPeriod","AverageNumberOfEmployeesDuringThePeriod","AverageNumberOfEmployees"]
+def months_between(d1:dt.date, d2:dt.date)->int:
+    """Whole months between dates (order agnostic)."""
+    if d1 > d2: d1, d2 = d2, d1
+    return (d2.year - d1.year)*12 + (d2.month - d1.month) - (1 if d2.day < d1.day else 0)
 
-def _num(s): 
+TURNOVER_TAGS=["Turnover","TurnoverRevenue","Revenue","Sales",
+               "RevenueFromContractWithCustomerExcludingAssessedTax",
+               "RevenueFromContractWithCustomerIncludingAssessedTax"]
+PROFIT_TAGS=["ProfitLoss","ProfitLossForPeriod","ProfitLossOnOrdinaryActivitiesBeforeTax",
+             "ProfitLossOnOrdinaryActivitiesAfterTax"]
+EMPLOYEE_TAGS=["AverageNumberEmployeesDuringPeriod","AverageNumberOfEmployeesDuringThePeriod",
+               "AverageNumberOfEmployees"]
+
+def _num(s):
     if s is None: return None
     try: return float(str(s).replace(",","").strip())
     except: return None
@@ -97,9 +106,9 @@ def _num(s):
 def _doc_fetch_content(doc_id:str)->tuple[bytes|None,str|None]:
     meta=_request("GET", f"{DOC_BASE}/document/{doc_id}").json()
     for mime in ("application/xhtml+xml","text/html","application/pdf"):
-        res=(meta.get("resources") or {}).get(mime); 
+        res=(meta.get("resources") or {}).get(mime)
         if not res: continue
-        url=res.get("links",{}).get("self"); 
+        url=res.get("links",{}).get("self")
         if not url: continue
         r=_request("GET", f"{DOC_BASE}{url}")
         if r.is_redirect and r.headers.get("Location"):
@@ -117,19 +126,20 @@ def extract_financials(company_number:str)->dict[str,Any]:
     if not doc_id: return out
     content,mime=_doc_fetch_content(doc_id)
     if not content or mime=="application/pdf": return out
-    from lxml import etree, html
     try: root=html.fromstring(content)
-    except: 
+    except:
         try: root=etree.fromstring(content)
         except: return out
     def pick(tags:list[str]):
-        xp="|".join([f".//*[local-name()='{t}']" for t in tags]); 
+        xp="|".join([f".//*[local-name()='{t}']" for t in tags])
         if not xp: return None
         for n in root.xpath(xp):
             v=_num((n.text or "").strip())
             if v is not None: return v
         return None
-    out["turnover"]=pick(TURNOVER_TAGS); out["profit"]=pick(PROFIT_TAGS); out["employees"]=pick(EMPLOYEE_TAGS)
+    out["turnover"]=pick(TURNOVER_TAGS)
+    out["profit"]=pick(PROFIT_TAGS)
+    out["employees"]=pick(EMPLOYEE_TAGS)
     return out
 
 # ---------- geo/radius ----------
@@ -152,12 +162,11 @@ def _bulk_lookup_postcodes(postcodes:list[str])->dict[str,tuple[float|None,float
                     q=(item.get("query") or "").strip().upper()
                     res=item.get("result") or {}
                     out[q]=(res.get("latitude"),res.get("longitude")) if res else (None,None)
-        except: 
+        except:
             for q in ch: out[q]=(None,None)
     return out
 
 def geocode_rows(rows:list[dict[str,Any]])->list[dict[str,Any]]:
-    """Add lat/lon for all rows with a postcode (no distance calc)."""
     pcs=[(r.get("postcode") or "").strip().upper() for r in rows]
     latlons=_bulk_lookup_postcodes(pcs)
     out=[]
@@ -170,14 +179,12 @@ def geocode_rows(rows:list[dict[str,Any]])->list[dict[str,Any]]:
 
 def filter_by_radius(rows:list[dict[str,Any]], centre_postcode:str, radius_km:float)->list[dict[str,Any]]:
     if not rows or not centre_postcode or radius_km<=0: return rows
-    # centre
     try:
         r=SESSION.get(f"https://api.postcodes.io/postcodes/{centre_postcode}", timeout=15)
         res=(r.json().get("result") or {}) if r.status_code==200 else {}
         lat0,lon0=res.get("latitude"),res.get("longitude")
     except: lat0=lon0=None
     if lat0 is None or lon0 is None: return []
-    # bulk geocode company postcodes
     pcs=[(r.get("postcode") or "").strip().upper() for r in rows]
     latlons=_bulk_lookup_postcodes(pcs)
     out=[]
@@ -192,12 +199,26 @@ def filter_by_radius(rows:list[dict[str,Any]], centre_postcode:str, radius_km:fl
     out.sort(key=lambda x: x.get("distance_km",1e9))
     return out
 
-# ---------- main search (unchanged behaviour) ----------
+# ---------- main search ----------
 
 def find_targets(
-    sic_codes:list[str], min_age:int=55, max_directors:int=2, size:int=100, pages:int=1, *,
-    limit_companies:int=120, fetch_financials:bool=False, financials_top_n:int=40,
-    min_employees:int=0, min_years_trading:int=0, fetch_psc:bool=False, psc_min_age:int=0, psc_max_count:int=2,
+    sic_codes:list[str],
+    min_age:int=55,
+    max_directors:int=2,
+    size:int=100,
+    pages:int=1,
+    *,
+    limit_companies:int=120,
+    fetch_financials:bool=False,
+    financials_top_n:int=40,
+    min_employees:int=0,
+    min_years_trading:int=0,
+    fetch_psc:bool=False,
+    psc_min_age:int=0,
+    psc_max_count:int=2,
+    # NEW: accounts freshness filters
+    require_accounts_within_months:int|None=None,   # e.g. 18 -> last_accounts.made_up_to must be within 18 months
+    exclude_overdue_accounts:bool=False,            # True to exclude if CH marks accounts 'overdue'
 )->list[dict[str,Any]]:
     results=[]; start_index=0; processed=0; today=dt.date.today()
 
@@ -206,6 +227,7 @@ def find_targets(
         if not items: break
         for c in items:
             if processed>=limit_companies: return results
+
             cnum=c.get("company_number")
             created=c.get("date_of_creation")
             years=None
@@ -214,7 +236,7 @@ def find_targets(
                     y,m,d=map(int,created.split("-")); t=today
                     years=t.year-y-((t.month,t.day)<(m,d))
                 except: years=None
-            if min_years_trading and (years is None or years<min_years_trading): 
+            if min_years_trading and (years is None or years<min_years_trading):
                 continue
 
             directors=get_directors(cnum)
@@ -223,12 +245,36 @@ def find_targets(
             if any(a is None or a<min_age for a in dir_ages): continue
             avg_dir_age=round(sum(a for a in dir_ages if a is not None)/len(dir_ages),1) if dir_ages else None
 
-            # postcode
-            ro=c.get("registered_office_address") or {}
+            # profile (to get postcode & accounts freshness)
+            prof=get_company_profile(cnum)
+            ro=prof.get("registered_office_address") or {}
             pc=ro.get("postal_code") or ro.get("postcode")
-            if not pc:
-                prof=get_company_profile(cnum); ro=prof.get("registered_office_address") or {}
-                pc=ro.get("postal_code") or ro.get("postcode")
+            accounts=prof.get("accounts") or {}
+
+            # accounts fields
+            la=(accounts.get("last_accounts") or {})
+            last_made = la.get("made_up_to") or la.get("period_end_on")
+            last_made_date=None
+            if last_made:
+                try:
+                    y,m,d = map(int, str(last_made).split("-"))
+                    last_made_date = dt.date(y,m,d)
+                except:
+                    pass
+            months_since=None
+            if last_made_date:
+                months_since = months_between(last_made_date, today)
+
+            # sometimes overdue flag is on accounts or on next_accounts
+            overdue = bool(accounts.get("overdue") or (accounts.get("next_accounts") or {}).get("overdue"))
+            next_due = (accounts.get("next_accounts") or {}).get("due_on") or (accounts.get("next_accounts") or {}).get("next_due")
+
+            if exclude_overdue_accounts and overdue:
+                processed+=1; continue
+            if require_accounts_within_months is not None:
+                # keep only if last_made_date exists and is within N months
+                if months_since is None or months_since > int(require_accounts_within_months):
+                    processed+=1; continue
 
             fin={"turnover":None,"profit":None,"employees":None}
             if fetch_financials and processed<financials_top_n:
@@ -263,6 +309,12 @@ def find_targets(
                 "employees":fin.get("employees"),
                 "psc_count":psc_count,
                 "psc_ages":",".join(map(str,psc_ages)) if psc_ages else None,
+                # accounts freshness
+                "last_accounts_made_up_to": str(last_made_date) if last_made_date else None,
+                "months_since_accounts": months_since,
+                "accounts_overdue": overdue,
+                "next_accounts_due": next_due,
+                # links
                 "ch_link":ch_link,
                 "google":google,
             })
