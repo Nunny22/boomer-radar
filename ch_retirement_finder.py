@@ -1,4 +1,4 @@
-# ch_retirement_finder.py — RATE-LIMIT SAFE + RADIUS + OPTIONAL TURNOVER
+# ch_retirement_finder.py — RATE-LIMIT SAFE + RADIUS + TURNOVER + PSC + EMPLOYEES + TRADING AGE
 
 import base64
 import datetime as dt
@@ -7,6 +7,7 @@ import os
 import time
 from collections import deque
 from typing import Any
+from urllib.parse import quote_plus
 
 import requests
 from lxml import etree, html
@@ -14,24 +15,23 @@ from lxml import etree, html
 # ---- API key from Streamlit Cloud secrets or environment ----
 API_KEY = os.getenv("CH_API_KEY", "")
 try:
-    import streamlit as st  # when running on Streamlit Cloud
+    import streamlit as st  # available on Streamlit Cloud
     API_KEY = API_KEY or (st.secrets.get("CH_API_KEY") if hasattr(st, "secrets") else "")
 except Exception:
     pass
 if not API_KEY:
-    raise RuntimeError("CH_API_KEY not set. Add it in Streamlit 'Secrets' or as an environment variable.")
+    raise RuntimeError("CH_API_KEY not set. Add it in Streamlit Secrets or env var.")
 
 API_BASE = "https://api.company-information.service.gov.uk"
 DOC_BASE = "https://document-api.company-information.service.gov.uk"
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "CH-Boomer-Radar/0.4"})
+SESSION.headers.update({"User-Agent": "CH-Boomer-Radar/0.5"})
 
-# ---- Simple token bucket to stay under 600 req / 5 min ----
+# ---- Throttle: stay under 600 requests / 5 min ----
 _WINDOW = 300.0  # seconds
-_LIMIT = 580     # keep a little headroom
+_LIMIT = 580
 _REQ_TIMES: deque[float] = deque()
-
 def _throttle():
     now = time.time()
     while _REQ_TIMES and now - _REQ_TIMES[0] > _WINDOW:
@@ -50,7 +50,6 @@ def _request(method: str, url: str, **kwargs) -> requests.Response:
     headers.update(_auth_header())
     _throttle()
     resp = SESSION.request(method, url, headers=headers, timeout=30, **kwargs)
-    # polite retry on rate/server errors
     if resp.status_code in (429, 500, 502, 503, 504):
         retry_after = int(resp.headers.get("Retry-After", "5"))
         time.sleep(retry_after)
@@ -98,7 +97,21 @@ def get_directors(company_number: str) -> list[dict[str, Any]]:
         out.append({"name": it.get("name"), "dob": it.get("date_of_birth") or {}})
     return out
 
-# ---------- Age helper ----------
+def get_psc(company_number: str) -> list[dict[str, Any]]:
+    """Active individual PSCs with DOB."""
+    params = {"items_per_page": 100}
+    data = ch_get(f"/company/{company_number}/persons-with-significant-control", params)
+    items = data.get("items") or []
+    out: list[dict[str, Any]] = []
+    for it in items:
+        if it.get("ceased_on"):
+            continue
+        if it.get("kind") != "individual-person-with-significant-control":
+            continue
+        out.append({"name": it.get("name"), "dob": it.get("date_of_birth") or {}})
+    return out
+
+# ---------- helpers ----------
 
 def approx_age(dob: dict[str, int] | None) -> int | None:
     if not dob or "year" not in dob:
@@ -108,8 +121,7 @@ def approx_age(dob: dict[str, int] | None) -> int | None:
     today = dt.date.today()
     return today.year - year - (today.month < month)
 
-# ---------- iXBRL turnover/profit (best-effort) ----------
-
+# iXBRL tags
 TURNOVER_TAGS = [
     "Turnover", "TurnoverRevenue", "Revenue", "Sales",
     "RevenueFromContractWithCustomerExcludingAssessedTax",
@@ -119,6 +131,11 @@ PROFIT_TAGS = [
     "ProfitLoss", "ProfitLossForPeriod",
     "ProfitLossOnOrdinaryActivitiesBeforeTax",
     "ProfitLossOnOrdinaryActivitiesAfterTax",
+]
+EMPLOYEE_TAGS = [
+    "AverageNumberEmployeesDuringPeriod",
+    "AverageNumberOfEmployeesDuringThePeriod",
+    "AverageNumberOfEmployees",
 ]
 
 def _parse_number(text: str | None) -> float | None:
@@ -150,7 +167,8 @@ def _doc_fetch_content(document_id: str) -> tuple[bytes | None, str | None]:
     return None, None
 
 def extract_financials(company_number: str) -> dict[str, Any]:
-    out = {"turnover": None, "profit": None}
+    """Best-effort: turnover/profit/employees from latest HTML/iXBRL accounts."""
+    out = {"turnover": None, "profit": None, "employees": None}
     fh = ch_get(f"/company/{company_number}/filing-history",
                 params={"category": "accounts", "items_per_page": 50})
     items = fh.get("items") or []
@@ -186,6 +204,7 @@ def extract_financials(company_number: str) -> dict[str, Any]:
 
     out["turnover"] = find_first(TURNOVER_TAGS)
     out["profit"] = find_first(PROFIT_TAGS)
+    out["employees"] = find_first(EMPLOYEE_TAGS)
     return out
 
 # ---------- Geo & radius ----------
@@ -228,89 +247,8 @@ def _lookup_one(pc: str) -> tuple[float | None, float | None]:
         pass
     return (None, None)
 
-# ---------- Main search with safety knobs ----------
+# ---------- Main search with filters ----------
 
 def find_targets(
     sic_codes: list[str],
     min_age: int = 55,
-    max_directors: int = 2,
-    size: int = 100,
-    pages: int = 1,
-    *,
-    limit_companies: int = 120,         # hard cap per run to avoid rate limit
-    fetch_financials: bool = False,     # toggle deep scrape
-    financials_top_n: int = 40,         # only first N get turnover/profit
-) -> list[dict[str, Any]]:
-    results: list[dict[str, Any]] = []
-    start_index = 0
-    processed = 0
-
-    for _ in range(pages):
-        data = advanced_search_by_sic(sic_codes, size=size, start_index=start_index)
-        items = data.get("items") or []
-        if not items:
-            break
-
-        for c in items:
-            if processed >= limit_companies:
-                return results
-
-            cnum = c.get("company_number")
-            directors = get_directors(cnum)
-            if not directors or len(directors) > max_directors:
-                continue
-
-            ages = [approx_age(d.get("dob")) for d in directors]
-            if any(a is None or a < min_age for a in ages):
-                continue
-
-            ro = c.get("registered_office_address") or {}
-            postcode = ro.get("postal_code") or ro.get("postcode")
-            if not postcode:
-                prof = get_company_profile(cnum)
-                ro = prof.get("registered_office_address") or {}
-                postcode = ro.get("postal_code") or ro.get("postcode")
-
-            fin = {"turnover": None, "profit": None}
-            if fetch_financials and processed < financials_top_n:
-                fin = extract_financials(cnum)
-
-            results.append({
-                "company_number": cnum,
-                "company_name": c.get("company_name"),
-                "incorporated": c.get("date_of_creation"),
-                "sic_codes": ",".join(c.get("sic_codes", [])),
-                "active_directors": len(directors),
-                "director_ages": ",".join(str(a) for a in ages if a is not None),
-                "postcode": postcode,
-                "turnover": fin.get("turnover"),
-                "profit": fin.get("profit"),
-            })
-            processed += 1
-            time.sleep(0.02)  # small pause; be polite
-
-        start_index += size
-
-    return results
-
-def filter_by_radius(rows: list[dict[str, Any]], centre_postcode: str, radius_km: float) -> list[dict[str, Any]]:
-    if not rows or not centre_postcode or radius_km <= 0:
-        return rows
-    lat0, lon0 = _lookup_one(centre_postcode)
-    if lat0 is None or lon0 is None:
-        return []
-    pcs = [r.get("postcode") or "" for r in rows]
-    latlons = _bulk_lookup_postcodes(pcs)
-    out: list[dict[str, Any]] = []
-    for r in rows:
-        pc = (r.get("postcode") or "").strip().upper()
-        lat, lon = latlons.get(pc, (None, None))
-        if lat is None or lon is None:
-            continue
-        dist = _haversine_km(lat0, lon0, lat, lon)
-        if dist <= radius_km:
-            rr = dict(r)
-            rr["distance_km"] = round(dist, 1)
-            out.append(rr)
-    out.sort(key=lambda x: x.get("distance_km", 1e9))
-    return out
