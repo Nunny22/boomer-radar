@@ -1,6 +1,6 @@
 # app.py — Boomer Radar
 # Polished UI + Boomer Score + Map + Outreach + Accounts/Confirmation freshness
-# + Risk flags + Outstanding charges + Shortlist/Notes + Caching friendly
+# + Risk flags + Outstanding charges + Shortlist/Notes + robust dtype handling for data_editor
 
 import math
 import urllib.parse as ul
@@ -210,8 +210,8 @@ if run:
         df = add_boomer_score(df, radius_km if centre_pc.strip() else None)
 
         # Inject shortlist/notes from session
-        df["shortlist"] = df["company_number"].map(st.session_state.shortlist_map).fillna(False)
-        df["notes"] = df["company_number"].map(st.session_state.notes_map).fillna("")
+        df["shortlist"] = df["company_number"].map(st.session_state.shortlist_map).fillna(False).astype(bool)
+        df["notes"] = df["company_number"].map(st.session_state.notes_map).fillna("").astype(str)
 
         # Outreach columns (subject/body + mailto: link)
         subs, bodies, links = [], [], []
@@ -223,6 +223,30 @@ if run:
         df["email_subject"] = subs
         df["email_body"] = bodies
         df["email_link"] = links
+
+        # ---------- DTYPE FIXES FOR data_editor ----------
+        # Make sure numeric columns are numeric (not object with None/strings)
+        numeric_cols = [
+            "boomer_score", "years_trading", "avg_director_age", "psc_count", "employees",
+            "turnover", "profit", "distance_km", "months_since_accounts",
+            "months_since_confirmation", "outstanding_charges",
+        ]
+        for c in numeric_cols:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+
+        # Map boolean-like flags to "Yes/No/—" strings so they match TextColumn
+        bool_text_cols = [
+            "accounts_overdue",
+            "confirmation_overdue",
+            "has_insolvency_history",
+            "has_charges",
+            "undeliverable_registered_office_address",
+            "registered_office_is_in_dispute",
+        ]
+        for c in bool_text_cols:
+            if c in df.columns:
+                df[c] = df[c].map(lambda x: "Yes" if x is True else ("No" if x is False else "—"))
 
         # KPIs
         c1, c2, c3, c4 = st.columns(4)
@@ -283,36 +307,38 @@ if run:
                 if c not in df_view.columns:
                     df_view[c] = None
 
-            # Editable shortlist + notes
+            # Editable shortlist + notes (all other columns disabled)
             edited = st.data_editor(
                 df_view[view_cols].sort_values("boomer_score", ascending=False),
                 use_container_width=True,
                 hide_index=True,
                 column_config={
                     "shortlist": st.column_config.CheckboxColumn("⭐", help="Add to shortlist"),
-                    "boomer_score": st.column_config.NumberColumn("Boomer score", format="%.1f"),
-                    "years_trading": st.column_config.NumberColumn("Years", format="%.0f"),
-                    "avg_director_age": st.column_config.NumberColumn("Dir age (avg)", format="%.0f"),
-                    "employees": st.column_config.NumberColumn("Employees", format="%.0f"),
-                    "turnover": st.column_config.NumberColumn("Turnover", format="£%0.0f"),
-                    "profit": st.column_config.NumberColumn("Profit", format="£%0.0f"),
-                    "distance_km": st.column_config.NumberColumn("Km away", format="%.1f"),
-                    "last_accounts_made_up_to": st.column_config.TextColumn("Last accounts"),
-                    "months_since_accounts": st.column_config.NumberColumn("Months since"),
-                    "accounts_overdue": st.column_config.TextColumn("Overdue?"),
-                    "next_accounts_due": st.column_config.TextColumn("Next due"),
-                    "confirmation_last_made_up_to": st.column_config.TextColumn("Last confirmation"),
-                    "months_since_confirmation": st.column_config.NumberColumn("Months since conf"),
-                    "confirmation_overdue": st.column_config.TextColumn("Conf overdue?"),
-                    "next_confirmation_due": st.column_config.TextColumn("Next conf due"),
-                    "has_insolvency_history": st.column_config.TextColumn("Insolvency?"),
-                    "has_charges": st.column_config.TextColumn("Has charges?"),
-                    "outstanding_charges": st.column_config.NumberColumn("Outstanding charges"),
-                    "undeliverable_registered_office_address": st.column_config.TextColumn("RO undeliverable?"),
-                    "registered_office_is_in_dispute": st.column_config.TextColumn("RO in dispute?"),
-                    "ch_link": st.column_config.LinkColumn("Companies House", display_text="Open"),
-                    "google": st.column_config.LinkColumn("Google", display_text="Search"),
-                    "email_link": st.column_config.LinkColumn("Email", display_text="Compose"),
+                    "boomer_score": st.column_config.NumberColumn("Boomer score", format="%.1f", disabled=True),
+                    "years_trading": st.column_config.NumberColumn("Years", format="%.0f", disabled=True),
+                    "avg_director_age": st.column_config.NumberColumn("Dir age (avg)", format="%.0f", disabled=True),
+                    "psc_count": st.column_config.NumberColumn("PSC", format="%.0f", disabled=True),
+                    "employees": st.column_config.NumberColumn("Employees", format="%.0f", disabled=True),
+                    "turnover": st.column_config.NumberColumn("Turnover", format="£%0.0f", disabled=True),
+                    "profit": st.column_config.NumberColumn("Profit", format="£%0.0f", disabled=True),
+                    "postcode": st.column_config.TextColumn("Postcode", disabled=True),
+                    "distance_km": st.column_config.NumberColumn("Km away", format="%.1f", disabled=True),
+                    "last_accounts_made_up_to": st.column_config.TextColumn("Last accounts", disabled=True),
+                    "months_since_accounts": st.column_config.NumberColumn("Months since", disabled=True),
+                    "accounts_overdue": st.column_config.TextColumn("Overdue?", disabled=True),
+                    "next_accounts_due": st.column_config.TextColumn("Next due", disabled=True),
+                    "confirmation_last_made_up_to": st.column_config.TextColumn("Last confirmation", disabled=True),
+                    "months_since_confirmation": st.column_config.NumberColumn("Months since conf", disabled=True),
+                    "confirmation_overdue": st.column_config.TextColumn("Conf overdue?", disabled=True),
+                    "next_confirmation_due": st.column_config.TextColumn("Next conf due", disabled=True),
+                    "has_insolvency_history": st.column_config.TextColumn("Insolvency?", disabled=True),
+                    "has_charges": st.column_config.TextColumn("Has charges?", disabled=True),
+                    "outstanding_charges": st.column_config.NumberColumn("Outstanding charges", disabled=True),
+                    "undeliverable_registered_office_address": st.column_config.TextColumn("RO undeliverable?", disabled=True),
+                    "registered_office_is_in_dispute": st.column_config.TextColumn("RO in dispute?", disabled=True),
+                    "ch_link": st.column_config.LinkColumn("Companies House", display_text="Open", disabled=True),
+                    "google": st.column_config.LinkColumn("Google", display_text="Search", disabled=True),
+                    "email_link": st.column_config.LinkColumn("Email", display_text="Compose", disabled=True),
                     "notes": st.column_config.TextColumn("Notes"),
                 },
             )
