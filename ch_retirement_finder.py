@@ -252,3 +252,125 @@ def _lookup_one(pc: str) -> tuple[float | None, float | None]:
 def find_targets(
     sic_codes: list[str],
     min_age: int = 55,
+    max_directors: int = 2,
+    size: int = 100,
+    pages: int = 1,
+    *,
+    limit_companies: int = 120,          # cap total processed per run
+    fetch_financials: bool = False,      # pull turnover/profit/employees for first N
+    financials_top_n: int = 40,
+    min_employees: int = 0,              # filter by employees (when available)
+    min_years_trading: int = 0,          # e.g. 10 or 15
+    fetch_psc: bool = False,             # pull PSCs (owners)
+    psc_min_age: int = 0,                # e.g. 55
+    psc_max_count: int = 2,              # e.g. ≤2 owners
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    start_index = 0
+    processed = 0
+    today = dt.date.today()
+
+    for _ in range(pages):
+        data = advanced_search_by_sic(sic_codes, size=size, start_index=start_index)
+        items = data.get("items") or []
+        if not items:
+            break
+
+        for c in items:
+            if processed >= limit_companies:
+                return results
+
+            cnum = c.get("company_number")
+            created = c.get("date_of_creation")
+            years_trading = None
+            if created:
+                try:
+                    y, m, d = map(int, created.split("-"))
+                    years_trading = today.year - y - ((today.month, today.day) < (m, d))
+                except Exception:
+                    pass
+            if min_years_trading and (years_trading is None or years_trading < min_years_trading):
+                continue
+
+            directors = get_directors(cnum)
+            if not directors or len(directors) > max_directors:
+                continue
+            ages = [approx_age(d.get("dob")) for d in directors]
+            if any(a is None or a < min_age for a in ages):
+                continue
+
+            ro = c.get("registered_office_address") or {}
+            postcode = ro.get("postal_code") or ro.get("postcode")
+            if not postcode:
+                prof = get_company_profile(cnum)
+                ro = prof.get("registered_office_address") or {}
+                postcode = ro.get("postal_code") or ro.get("postcode")
+
+            fin = {"turnover": None, "profit": None, "employees": None}
+            if fetch_financials and processed < financials_top_n:
+                fin = extract_financials(cnum)
+                if min_employees and fin.get("employees") is not None and fin["employees"] < min_employees:
+                    processed += 1
+                    continue
+
+            psc_ages: list[int] = []
+            psc_count = None
+            if fetch_psc:
+                pscs = get_psc(cnum)
+                psc_count = len(pscs)
+                psc_ages = [a for a in (approx_age(p.get("dob")) for p in pscs) if a is not None]
+                if psc_max_count and psc_count > psc_max_count:
+                    processed += 1
+                    continue
+                if psc_min_age and (not psc_ages or any(a < psc_min_age for a in psc_ages)):
+                    processed += 1
+                    continue
+
+            ch_link = f"https://find-and-update.company-information.service.gov.uk/company/{cnum}"
+            google_link = f"https://www.google.com/search?q={quote_plus((c.get('company_name') or '') + ' ' + (postcode or ''))}"
+
+            results.append({
+                "company_number": cnum,
+                "company_name": c.get("company_name"),
+                "incorporated": created,
+                "years_trading": years_trading,
+                "sic_codes": ",".join(c.get("sic_codes", [])),
+                "active_directors": len(directors),
+                "director_ages": ",".join(str(a) for a in ages if a is not None),
+                "postcode": postcode,
+                "turnover": fin.get("turnover"),
+                "profit": fin.get("profit"),
+                "employees": fin.get("employees"),
+                "psc_count": psc_count,
+                "psc_ages": ",".join(map(str, psc_ages)) if psc_ages else None,
+                "ch_link": ch_link,
+                "google": google_link,
+            })
+            processed += 1
+            time.sleep(0.02)
+
+        start_index += size
+
+    return results
+
+def filter_by_radius(rows: list[dict[str, Any]], centre_postcode: str, radius_km: float) -> list[dict[str, Any]]:
+    if not rows or not centre_postcode or radius_km <= 0:
+        return rows
+    lat0, lon0 = _lookup_one(centre_postcode)
+    if lat0 is None or lon0 is None:
+        return []
+    pcs = [r.get("postcode") or "" for r in rows]
+    latlons = _bulk_lookup_postcodes(pcs)
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        pc = (r.get("postcode") or "").strip().upper()
+        lat, lon = latlons.get(pc, (None, None))
+        if lat is None or lon is None:
+            continue
+        dist = _haversine_km(lat0, lon0, lat, lon)
+        if dist <= radius_km:
+            rr = dict(r)
+            rr["distance_km"] = round(dist, 1)
+            out.append(rr)
+    out.sort(key=lambda x: x.get("distance_km", 1e9))
+    return out
