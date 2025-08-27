@@ -1,5 +1,4 @@
-# Streamlit UI — rate-limit safe controls
-# Run local: streamlit run app.py
+# Streamlit UI — adds trading age, PSC, employees, outreach links + rate-limit controls
 
 import pandas as pd
 import streamlit as st
@@ -16,6 +15,7 @@ with st.sidebar:
     )
     min_age = st.number_input("Minimum director age", min_value=50, max_value=90, value=55)
     max_directors = st.number_input("Max active directors", min_value=1, max_value=5, value=2)
+    min_years_trading = st.slider("Min years trading (incorporated)", 0, 40, 10)
 
     st.divider()
     st.subheader("Rate-limit safe settings")
@@ -23,9 +23,17 @@ with st.sidebar:
     size = st.slider("Advanced search page size", 50, 500, 100, step=50)
     pages = st.slider("Pages to fetch", 1, 10, 1)
 
-    fetch_financials = st.checkbox("Fetch turnover/profit (slower)", value=False,
-                                   help="Extra calls per company. Use sparingly.")
-    financials_top_n = st.slider("Only fetch turnover for first N companies", 10, 100, 40, step=10)
+    st.divider()
+    st.subheader("Financials (best-effort iXBRL)")
+    fetch_financials = st.checkbox("Fetch turnover/profit & employees (slower)", value=False)
+    financials_top_n = st.slider("Only fetch for first N companies", 10, 100, 40, step=10)
+    min_employees = st.slider("Min employees (if known)", 0, 500, 0, step=5)
+
+    st.divider()
+    st.subheader("Owners (PSC) filter (optional)")
+    fetch_psc = st.checkbox("Check PSC owners", value=False)
+    psc_min_age = st.slider("PSC min age", 0, 90, 55)
+    psc_max_count = st.slider("PSC max count", 1, 5, 2)
 
     st.divider()
     st.subheader("Radius filter (optional)")
@@ -36,7 +44,7 @@ with st.sidebar:
 
 if run:
     sic_codes = [s.strip() for part in sic_str.split(",") for s in part.split() if s.strip()]
-    with st.spinner("Querying Companies House… (built-in throttle enabled)"):
+    with st.spinner("Querying Companies House… (throttled)"):
         rows = find_targets(
             sic_codes,
             min_age=int(min_age),
@@ -46,6 +54,11 @@ if run:
             limit_companies=int(limit_companies),
             fetch_financials=bool(fetch_financials),
             financials_top_n=int(financials_top_n),
+            min_employees=int(min_employees),
+            min_years_trading=int(min_years_trading),
+            fetch_psc=bool(fetch_psc),
+            psc_min_age=int(psc_min_age),
+            psc_max_count=int(psc_max_count),
         )
 
     if centre_pc.strip():
@@ -53,14 +66,14 @@ if run:
             rows = filter_by_radius(rows, centre_pc.strip(), float(radius_km))
 
     if not rows:
-        st.warning("No matching companies (or none within radius). Try more pages or adjust filters.")
+        st.warning("No matching companies (or none within radius). Try more pages or relax filters.")
     else:
         df = pd.DataFrame(rows)
         st.dataframe(df, width="stretch")
         st.download_button(
-            "Download CSV",
+            "Download outreach CSV",
             data=df.to_csv(index=False),
-            file_name="ch_baby_boomer_radar.csv",
+            file_name="boomer_radar_targets.csv",
             mime="text/csv",
         )
-
+        st.caption("CSV includes CH profile and Google search links for each company.")
