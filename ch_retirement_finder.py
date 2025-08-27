@@ -1,6 +1,6 @@
 # ch_retirement_finder.py
 # Rate-limit safe + caching + radius + turnover/psc/employees + accounts + confirmation statement
-# + risk flags + outstanding charges + geocoding helpers
+# + risk flags + outstanding charges + geocoding helpers (Python 3.8+ compatible typing)
 
 import base64
 import datetime as dt
@@ -8,7 +8,7 @@ import math
 import os
 import time
 from collections import deque
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
 
 import requests
@@ -19,11 +19,12 @@ from lxml import etree, html
 # -------------------------------------------------
 API_KEY = os.getenv("CH_API_KEY", "")
 try:
-    import streamlit as st
-
-    API_KEY = API_KEY or (st.secrets.get("CH_API_KEY") if hasattr(st, "secrets") else "")
+    import streamlit as st  # type: ignore
 except Exception:
     st = None  # type: ignore
+
+if st is not None:
+    API_KEY = API_KEY or (st.secrets.get("CH_API_KEY") if hasattr(st, "secrets") else "")
 
 if not API_KEY:
     raise RuntimeError("CH_API_KEY not set. Add it in Streamlit Secrets or env var.")
@@ -40,14 +41,14 @@ API_BASE = "https://api.company-information.service.gov.uk"
 DOC_BASE = "https://document-api.company-information.service.gov.uk"
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "CH-Boomer-Radar/0.9"})
+SESSION.headers.update({"User-Agent": "CH-Boomer-Radar/0.9.1"})
 
 # -------------------------------------------------
 # Throttle (~600 requests / 5 min)
 # -------------------------------------------------
 _WINDOW = 300.0
 _LIMIT = 580
-_REQ_TIMES: deque[float] = deque()
+_REQ_TIMES: deque = deque()
 
 
 def _throttle():
@@ -60,7 +61,7 @@ def _throttle():
     _REQ_TIMES.append(time.time())
 
 
-def _auth_header() -> dict[str, str]:
+def _auth_header() -> Dict[str, str]:
     token = base64.b64encode(f"{API_KEY}:".encode()).decode()
     return {"Authorization": f"Basic {token}"}
 
@@ -83,7 +84,7 @@ def _request(method: str, url: str, **kwargs) -> requests.Response:
 # Cached GET to Companies House
 # -------------------------------------------------
 @_cache_data(ttl=3600, show_spinner=False)
-def _ch_get_cached(path: str, params_key: tuple[tuple[str, Any], ...]) -> dict[str, Any]:
+def _ch_get_cached(path: str, params_key: Tuple[Tuple[str, Any], ...]) -> Dict[str, Any]:
     url = f"{API_BASE}{path}"
     params = dict(params_key)
     resp = _request("GET", url, params=params)
@@ -92,8 +93,8 @@ def _ch_get_cached(path: str, params_key: tuple[tuple[str, Any], ...]) -> dict[s
     return resp.json()
 
 
-def ch_get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-    params_key = tuple(sorted((params or {}).items()))
+def ch_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    params_key: Tuple[Tuple[str, Any], ...] = tuple(sorted((params or {}).items()))
     return _ch_get_cached(path, params_key)
 
 
@@ -101,24 +102,24 @@ def ch_get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
 # Companies House endpoints
 # -------------------------------------------------
 def advanced_search_by_sic(
-    sic_codes: list[str],
+    sic_codes: List[str],
     size: int = 100,
     start_index: int = 0,
     company_status: str = "active",
-) -> dict[str, Any]:
+) -> Dict[str, Any]:
     return ch_get(
         "/advanced-search/companies",
         {"sic_codes": ",".join(sic_codes), "size": size, "start_index": start_index, "company_status": company_status},
     )
 
 
-def get_company_profile(company_number: str) -> dict[str, Any]:
+def get_company_profile(company_number: str) -> Dict[str, Any]:
     return ch_get(f"/company/{company_number}")
 
 
-def get_directors(company_number: str) -> list[dict[str, Any]]:
+def get_directors(company_number: str) -> List[Dict[str, Any]]:
     data = ch_get(f"/company/{company_number}/officers", {"items_per_page": 100, "order_by": "appointed_on"})
-    out: list[dict[str, Any]] = []
+    out: List[Dict[str, Any]] = []
     for it in data.get("items") or []:
         if it.get("officer_role") != "director":
             continue
@@ -128,9 +129,9 @@ def get_directors(company_number: str) -> list[dict[str, Any]]:
     return out
 
 
-def get_psc(company_number: str) -> list[dict[str, Any]]:
+def get_psc(company_number: str) -> List[Dict[str, Any]]:
     data = ch_get(f"/company/{company_number}/persons-with-significant-control", {"items_per_page": 100})
-    out: list[dict[str, Any]] = []
+    out: List[Dict[str, Any]] = []
     for it in data.get("items") or []:
         if it.get("ceased_on"):
             continue
@@ -141,7 +142,7 @@ def get_psc(company_number: str) -> list[dict[str, Any]]:
 
 
 @_cache_data(ttl=3600, show_spinner=False)
-def get_outstanding_charges_count(company_number: str) -> int | None:
+def get_outstanding_charges_count(company_number: str) -> Optional[int]:
     """Count outstanding charges; returns None if endpoint fails."""
     try:
         data = ch_get(f"/company/{company_number}/charges")
@@ -154,7 +155,7 @@ def get_outstanding_charges_count(company_number: str) -> int | None:
 # -------------------------------------------------
 # Helpers
 # -------------------------------------------------
-def approx_age(dob: dict[str, int] | None) -> int | None:
+def approx_age(dob: Optional[Dict[str, int]]) -> Optional[int]:
     if not dob or "year" not in dob:
         return None
     y, m = dob["year"], dob.get("month", 6)
@@ -189,7 +190,7 @@ EMPLOYEE_TAGS = [
 ]
 
 
-def _num(s):
+def _num(s: Any) -> Optional[float]:
     if s is None:
         return None
     try:
@@ -200,7 +201,7 @@ def _num(s):
 
 # --------- cached doc fetch ----------
 @_cache_data(ttl=43200, show_spinner=False)
-def _doc_fetch_content_cached(document_id: str) -> tuple[bytes | None, str | None]:
+def _doc_fetch_content_cached(document_id: str) -> Tuple[Optional[bytes], Optional[str]]:
     meta = _request("GET", f"{DOC_BASE}/document/{document_id}").json()
     resources = meta.get("resources") or {}
     for mime in ("application/xhtml+xml", "text/html", "application/pdf"):
@@ -218,10 +219,10 @@ def _doc_fetch_content_cached(document_id: str) -> tuple[bytes | None, str | Non
     return None, None
 
 
-def extract_financials(company_number: str) -> dict[str, Any]:
-    out = {"turnover": None, "profit": None, "employees": None}
+def extract_financials(company_number: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"turnover": None, "profit": None, "employees": None}
     fh = ch_get(f"/company/{company_number}/filing-history", {"category": "accounts", "items_per_page": 50})
-    doc_id = None
+    doc_id: Optional[str] = None
     for it in fh.get("items") or []:
         meta_url = (it.get("links") or {}).get("document_metadata")
         if meta_url and "/document/" in meta_url:
@@ -240,7 +241,7 @@ def extract_financials(company_number: str) -> dict[str, Any]:
         except Exception:
             return out
 
-    def pick(tags: list[str]):
+    def pick(tags: List[str]) -> Optional[float]:
         xp = "|".join([f".//*[local-name()='{t}']" for t in tags])
         if not xp:
             return None
@@ -260,8 +261,8 @@ def extract_financials(company_number: str) -> dict[str, Any]:
 # Geo / Radius
 # -------------------------------------------------
 @_cache_data(ttl=86400, show_spinner=False)
-def _postcodes_bulk_cached(chunk: tuple[str, ...]) -> dict[str, tuple[float | None, float | None]]:
-    out: dict[str, tuple[float | None, float | None]] = {}
+def _postcodes_bulk_cached(chunk: Tuple[str, ...]) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
+    out: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
     try:
         r = SESSION.post("https://api.postcodes.io/postcodes", json={"postcodes": list(chunk)}, timeout=30)
         if r.status_code == 200:
@@ -275,8 +276,8 @@ def _postcodes_bulk_cached(chunk: tuple[str, ...]) -> dict[str, tuple[float | No
     return out
 
 
-def _bulk_lookup_postcodes(postcodes: list[str]) -> dict[str, tuple[float | None, float | None]]:
-    out: dict[str, tuple[float | None, float | None]] = {}
+def _bulk_lookup_postcodes(postcodes: List[str]) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
+    out: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
     uniq = [p for p in sorted({(p or "").strip().upper() for p in postcodes}) if p]
     for i in range(0, len(uniq), 100):
         chunk = tuple(uniq[i : i + 100])
@@ -284,10 +285,10 @@ def _bulk_lookup_postcodes(postcodes: list[str]) -> dict[str, tuple[float | None
     return out
 
 
-def geocode_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def geocode_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     pcs = [(r.get("postcode") or "").strip().upper() for r in rows]
     latlons = _bulk_lookup_postcodes(pcs)
-    out: list[dict[str, Any]] = []
+    out: List[Dict[str, Any]] = []
     for r in rows:
         pc = (r.get("postcode") or "").strip().upper()
         lat, lon = latlons.get(pc, (None, None))
@@ -298,7 +299,7 @@ def geocode_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
-def _hav(lat1, lon1, lat2, lon2):
+def _hav(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6371.0
     p1, p2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
@@ -307,7 +308,7 @@ def _hav(lat1, lon1, lat2, lon2):
     return 2 * R * math.asin(math.sqrt(a))
 
 
-def filter_by_radius(rows: list[dict[str, Any]], centre_postcode: str, radius_km: float) -> list[dict[str, Any]]:
+def filter_by_radius(rows: List[Dict[str, Any]], centre_postcode: str, radius_km: float) -> List[Dict[str, Any]]:
     if not rows or not centre_postcode or radius_km <= 0:
         return rows
     try:
@@ -320,7 +321,7 @@ def filter_by_radius(rows: list[dict[str, Any]], centre_postcode: str, radius_km
         return []
     pcs = [(r.get("postcode") or "").strip().upper() for r in rows]
     latlons = _bulk_lookup_postcodes(pcs)
-    out: list[dict[str, Any]] = []
+    out: List[Dict[str, Any]] = []
     for r in rows:
         pc = (r.get("postcode") or "").strip().upper()
         lat, lon = latlons.get(pc, (None, None))
@@ -341,7 +342,7 @@ def filter_by_radius(rows: list[dict[str, Any]], centre_postcode: str, radius_km
 # Main search
 # -------------------------------------------------
 def find_targets(
-    sic_codes: list[str],
+    sic_codes: List[str],
     min_age: int = 55,
     max_directors: int = 2,
     size: int = 100,
@@ -356,10 +357,10 @@ def find_targets(
     psc_min_age: int = 0,
     psc_max_count: int = 2,
     # Accounts freshness
-    require_accounts_within_months: int | None = None,
+    require_accounts_within_months: Optional[int] = None,
     exclude_overdue_accounts: bool = False,
     # Confirmation statement freshness
-    require_confirmation_within_months: int | None = None,
+    require_confirmation_within_months: Optional[int] = None,
     exclude_overdue_confirmation: bool = False,
     # Risk / Address flags
     exclude_insolvency_history: bool = False,
@@ -368,12 +369,12 @@ def find_targets(
     # Charges
     fetch_charges_count: bool = False,
     charges_top_n: int = 50,
-    max_outstanding_charges: int | None = None,
-) -> list[dict[str, Any]]:
+    max_outstanding_charges: Optional[int] = None,
+) -> List[Dict[str, Any]]:
     """
-    Returns list of dicts with lots of fields (see below). Filters are applied inline to save API calls.
+    Returns list of dicts with lots of fields. Filters are applied inline to save API calls.
     """
-    results: list[dict[str, Any]] = []
+    results: List[Dict[str, Any]] = []
     start_index = 0
     processed = 0
     today = dt.date.today()
@@ -388,7 +389,7 @@ def find_targets(
 
             cnum = c.get("company_number")
             created = c.get("date_of_creation")
-            years = None
+            years: Optional[int] = None
             if created:
                 try:
                     y, m, d = map(int, created.split("-"))
@@ -404,9 +405,11 @@ def find_targets(
             if not directors or len(directors) > max_directors:
                 continue
             dir_ages = [approx_age(d.get("dob")) for d in directors]
-            if any(a is None or a < min_age for a in dir_ages):
+            if any((a is None) or (a < min_age) for a in dir_ages):
                 continue
-            avg_dir_age = round(sum(a for a in dir_ages if a is not None) / len(dir_ages), 1) if dir_ages else None
+            avg_dir_age: Optional[float] = round(
+                sum(a for a in dir_ages if a is not None) / len(dir_ages), 1
+            ) if dir_ages else None
 
             # Profile for address + accounts + confirmation + flags
             prof = get_company_profile(cnum)
@@ -433,14 +436,14 @@ def find_targets(
             accounts = prof.get("accounts") or {}
             la = accounts.get("last_accounts") or {}
             last_made = la.get("made_up_to") or la.get("period_end_on")
-            last_made_date = None
+            last_made_date: Optional[dt.date] = None
             if last_made:
                 try:
                     y, m, d = map(int, str(last_made).split("-"))
                     last_made_date = dt.date(y, m, d)
                 except Exception:
                     pass
-            months_since_accounts = None
+            months_since_accounts: Optional[int] = None
             if last_made_date:
                 months_since_accounts = months_between(last_made_date, today)
             accounts_overdue = bool(accounts.get("overdue") or (accounts.get("next_accounts") or {}).get("overdue"))
@@ -450,36 +453,36 @@ def find_targets(
                 processed += 1
                 continue
             if require_accounts_within_months is not None:
-                if months_since_accounts is None or months_since_accounts > int(require_accounts_within_months):
+                if (months_since_accounts is None) or (months_since_accounts > int(require_accounts_within_months)):
                     processed += 1
                     continue
 
             # Confirmation statement freshness
             conf = prof.get("confirmation_statement") or {}
             conf_last = conf.get("last_made_up_to")
-            conf_last_date = None
+            conf_last_date: Optional[dt.date] = None
             if conf_last:
                 try:
                     y, m, d = map(int, str(conf_last).split("-"))
                     conf_last_date = dt.date(y, m, d)
                 except Exception:
                     pass
-            months_since_conf = None
+            months_since_conf: Optional[int] = None
             if conf_last_date:
                 months_since_conf = months_between(conf_last_date, today)
-            conf_overdue = bool((conf.get("overdue")))
+            conf_overdue = bool(conf.get("overdue"))
             conf_next_due = conf.get("next_due")
 
             if exclude_overdue_confirmation and conf_overdue:
                 processed += 1
                 continue
             if require_confirmation_within_months is not None:
-                if months_since_conf is None or months_since_conf > int(require_confirmation_within_months):
+                if (months_since_conf is None) or (months_since_conf > int(require_confirmation_within_months)):
                     processed += 1
                     continue
 
             # Financials (optional; best-effort iXBRL)
-            fin = {"turnover": None, "profit": None, "employees": None}
+            fin: Dict[str, Any] = {"turnover": None, "profit": None, "employees": None}
             if fetch_financials and processed < financials_top_n:
                 fin = extract_financials(cnum)
                 if min_employees and fin.get("employees") is not None and fin["employees"] < min_employees:
@@ -487,14 +490,14 @@ def find_targets(
                     continue
 
             # PSC ages
-            avg_psc_age = None
-            psc_ages: list[int] = []
-            psc_count = None
+            avg_psc_age: Optional[float] = None
+            psc_ages: List[int] = []
+            psc_count: Optional[int] = None
             if fetch_psc:
                 pscs = get_psc(cnum)
                 psc_count = len(pscs)
                 psc_ages = [a for a in (approx_age(p.get("dob")) for p in pscs) if a is not None]
-                if psc_max_count and psc_count > psc_max_count:
+                if psc_max_count and (psc_count is not None) and psc_count > psc_max_count:
                     processed += 1
                     continue
                 if psc_min_age and (not psc_ages or any(a < psc_min_age for a in psc_ages)):
@@ -504,10 +507,10 @@ def find_targets(
                     avg_psc_age = round(sum(psc_ages) / len(psc_ages), 1)
 
             # Charges (optional)
-            outstanding_charges = None
+            outstanding_charges: Optional[int] = None
             if fetch_charges_count and processed < charges_top_n:
                 outstanding_charges = get_outstanding_charges_count(cnum)
-                if max_outstanding_charges is not None and outstanding_charges is not None:
+                if (max_outstanding_charges is not None) and (outstanding_charges is not None):
                     if outstanding_charges > int(max_outstanding_charges):
                         processed += 1
                         continue
