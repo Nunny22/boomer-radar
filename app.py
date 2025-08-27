@@ -1,5 +1,5 @@
-# Streamlit UI — with radius + turnover
-# Run locally: streamlit run app.py
+# Streamlit UI — rate-limit safe controls
+# Run local: streamlit run app.py
 
 import pandas as pd
 import streamlit as st
@@ -16,8 +16,16 @@ with st.sidebar:
     )
     min_age = st.number_input("Minimum director age", min_value=50, max_value=90, value=55)
     max_directors = st.number_input("Max active directors", min_value=1, max_value=5, value=2)
-    size = st.slider("Results per page (CH advanced search)", min_value=50, max_value=1000, value=300, step=50)
-    pages = st.slider("Pages to fetch", min_value=1, max_value=10, value=1)
+
+    st.divider()
+    st.subheader("Rate-limit safe settings")
+    limit_companies = st.slider("Max companies to scan this run", 20, 200, 120, step=10)
+    size = st.slider("Advanced search page size", 50, 500, 100, step=50)
+    pages = st.slider("Pages to fetch", 1, 10, 1)
+
+    fetch_financials = st.checkbox("Fetch turnover/profit (slower)", value=False,
+                                   help="Extra calls per company. Use sparingly.")
+    financials_top_n = st.slider("Only fetch turnover for first N companies", 10, 100, 40, step=10)
 
     st.divider()
     st.subheader("Radius filter (optional)")
@@ -28,25 +36,24 @@ with st.sidebar:
 
 if run:
     sic_codes = [s.strip() for part in sic_str.split(",") for s in part.split() if s.strip()]
-    with st.spinner("Querying Companies House…"):
-        try:
-            rows = find_targets(
-                sic_codes,
-                min_age=int(min_age),
-                max_directors=int(max_directors),
-                size=int(size),
-                pages=int(pages),
-            )
-        except Exception as e:
-            st.error(f"Error: {e}")
-            st.stop()
+    with st.spinner("Querying Companies House… (built-in throttle enabled)"):
+        rows = find_targets(
+            sic_codes,
+            min_age=int(min_age),
+            max_directors=int(max_directors),
+            size=int(size),
+            pages=int(pages),
+            limit_companies=int(limit_companies),
+            fetch_financials=bool(fetch_financials),
+            financials_top_n=int(financials_top_n),
+        )
 
     if centre_pc.strip():
         with st.spinner("Filtering by radius…"):
             rows = filter_by_radius(rows, centre_pc.strip(), float(radius_km))
 
     if not rows:
-        st.warning("No matching companies found (or none within that radius). Try more pages or different SICs.")
+        st.warning("No matching companies (or none within radius). Try more pages or adjust filters.")
     else:
         df = pd.DataFrame(rows)
         st.dataframe(df, width="stretch")
@@ -56,3 +63,4 @@ if run:
             file_name="ch_baby_boomer_radar.csv",
             mime="text/csv",
         )
+
