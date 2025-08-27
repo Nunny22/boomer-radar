@@ -121,7 +121,7 @@ def _norm(x, lo, hi):
     return (v - lo) / (hi - lo)
 
 
-def add_boomer_score(df: pd.DataFrame, radius_used: float | None):
+def add_boomer_score(df: pd.DataFrame, radius_used: float or None):
     dir_age = df["avg_director_age"].apply(lambda a: _norm(a, 55, 85))
     psc_age = df["avg_psc_age"].where(df["avg_psc_age"].notna(), df["avg_director_age"]).apply(lambda a: _norm(a, 55, 85))
     years = df["years_trading"].apply(lambda y: _norm(y, 5, 30))
@@ -226,3 +226,149 @@ if run:
 
         # KPIs
         c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.markdown(f'<div class="kpi"><small>Results</small><h3>{len(df):,}</h3></div>', unsafe_allow_html=True)
+        with c2:
+            st.markdown(f'<div class="kpi"><small>Avg score</small><h3>{df["boomer_score"].mean():.1f}</h3></div>', unsafe_allow_html=True)
+        with c3:
+            st.markdown(f'<div class="kpi"><small>Avg years</small><h3>{df["years_trading"].mean():.1f}</h3></div>', unsafe_allow_html=True)
+        with c4:
+            st.markdown(f'<div class="kpi"><small>Avg dir age</small><h3>{df["avg_director_age"].mean():.1f}</h3></div>', unsafe_allow_html=True)
+
+        # Tabs: Results / Map / About
+        t1, t2, t3 = st.tabs(["📋 Results", "🗺️ Map", "ℹ️ About"])
+
+        with t1:
+            show_shortlist_only = st.checkbox("Show shortlist only", value=False)
+            if show_shortlist_only:
+                df_view = df[df["shortlist"] == True].copy()  # noqa: E712
+            else:
+                df_view = df.copy()
+
+            view_cols = [
+                "shortlist",
+                "boomer_score",
+                "company_name",
+                "company_number",
+                "years_trading",
+                "avg_director_age",
+                "psc_count",
+                "employees",
+                "turnover",
+                "profit",
+                "postcode",
+                "distance_km",
+                # accounts & confirmation freshness
+                "last_accounts_made_up_to",
+                "months_since_accounts",
+                "accounts_overdue",
+                "next_accounts_due",
+                "confirmation_last_made_up_to",
+                "months_since_confirmation",
+                "confirmation_overdue",
+                "next_confirmation_due",
+                # risk flags & charges
+                "has_insolvency_history",
+                "has_charges",
+                "outstanding_charges",
+                "undeliverable_registered_office_address",
+                "registered_office_is_in_dispute",
+                # links & outreach
+                "ch_link",
+                "google",
+                "email_link",
+                "notes",
+            ]
+            for c in view_cols:
+                if c not in df_view.columns:
+                    df_view[c] = None
+
+            # Editable shortlist + notes
+            edited = st.data_editor(
+                df_view[view_cols].sort_values("boomer_score", ascending=False),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "shortlist": st.column_config.CheckboxColumn("⭐", help="Add to shortlist"),
+                    "boomer_score": st.column_config.NumberColumn("Boomer score", format="%.1f"),
+                    "years_trading": st.column_config.NumberColumn("Years", format="%.0f"),
+                    "avg_director_age": st.column_config.NumberColumn("Dir age (avg)", format="%.0f"),
+                    "employees": st.column_config.NumberColumn("Employees", format="%.0f"),
+                    "turnover": st.column_config.NumberColumn("Turnover", format="£%0.0f"),
+                    "profit": st.column_config.NumberColumn("Profit", format="£%0.0f"),
+                    "distance_km": st.column_config.NumberColumn("Km away", format="%.1f"),
+                    "last_accounts_made_up_to": st.column_config.TextColumn("Last accounts"),
+                    "months_since_accounts": st.column_config.NumberColumn("Months since"),
+                    "accounts_overdue": st.column_config.TextColumn("Overdue?"),
+                    "next_accounts_due": st.column_config.TextColumn("Next due"),
+                    "confirmation_last_made_up_to": st.column_config.TextColumn("Last confirmation"),
+                    "months_since_confirmation": st.column_config.NumberColumn("Months since conf"),
+                    "confirmation_overdue": st.column_config.TextColumn("Conf overdue?"),
+                    "next_confirmation_due": st.column_config.TextColumn("Next conf due"),
+                    "has_insolvency_history": st.column_config.TextColumn("Insolvency?"),
+                    "has_charges": st.column_config.TextColumn("Has charges?"),
+                    "outstanding_charges": st.column_config.NumberColumn("Outstanding charges"),
+                    "undeliverable_registered_office_address": st.column_config.TextColumn("RO undeliverable?"),
+                    "registered_office_is_in_dispute": st.column_config.TextColumn("RO in dispute?"),
+                    "ch_link": st.column_config.LinkColumn("Companies House", display_text="Open"),
+                    "google": st.column_config.LinkColumn("Google", display_text="Search"),
+                    "email_link": st.column_config.LinkColumn("Email", display_text="Compose"),
+                    "notes": st.column_config.TextColumn("Notes"),
+                },
+            )
+
+            # Persist shortlist/notes into session
+            for _, r in edited[["company_number", "shortlist", "notes"]].iterrows():
+                st.session_state.shortlist_map[str(r["company_number"])] = bool(r["shortlist"])
+                st.session_state.notes_map[str(r["company_number"])] = str(r["notes"])
+
+            # Include shortlist/notes in the CSV export (using edited table)
+            st.download_button(
+                "Download outreach CSV",
+                data=edited.to_csv(index=False),
+                file_name="boomer_radar_targets.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+        with t2:
+            if {"lat", "lon"}.issubset(df.columns) and df["lat"].notna().any():
+                dmap = df.dropna(subset=["lat", "lon"]).copy()
+                dmap["size"] = 400 + (dmap["boomer_score"].fillna(50) * 6)  # marker radius
+                layer = pdk.Layer(
+                    "ScatterplotLayer",
+                    data=dmap,
+                    get_position="[lon, lat]",
+                    get_radius="size",
+                    pickable=True,
+                )
+                tooltip = {"html": "<b>{company_name}</b><br/>Score: {boomer_score}<br/>{postcode}"}
+                st.pydeck_chart(
+                    pdk.Deck(
+                        map_style="mapbox://styles/mapbox/light-v9",
+                        initial_view_state=pdk.ViewState(
+                            latitude=float(dmap["lat"].mean()),
+                            longitude=float(dmap["lon"].mean()),
+                            zoom=6,
+                        ),
+                        layers=[layer],
+                        tooltip=tooltip,
+                    )
+                )
+            else:
+                st.info("No coordinates yet. Use the Radius filter or run without radius to geocode all.")
+
+        with t3:
+            st.markdown(
+                """
+**Filters included**
+
+- Accounts: `last_accounts.made_up_to` (months since) + overdue flag  
+- Confirmation: `confirmation_statement.last_made_up_to` (months since) + overdue flag  
+- Risk flags: insolvency history, undeliverable office address, office in dispute  
+- Outstanding charges: optional count from charges endpoint (with max allowed)  
+
+**Shortlist & Notes**  
+Use the ⭐ column to shortlist and jot notes; included in the CSV.
+"""
+            )
