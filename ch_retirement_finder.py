@@ -1,6 +1,5 @@
-# ch_retirement_finder.py
-# Rate-limit safe + caching + radius + turnover/psc/employees + accounts + confirmation statement
-# + risk flags + outstanding charges + geocoding helpers (Python 3.8+ compatible typing)
+# ch_retirement_finder.py — simplified for Boomer Radar v1
+# Rate-limit safe Companies House helpers + radius filtering.
 
 import base64
 import datetime as dt
@@ -12,11 +11,11 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
 
 import requests
-from lxml import etree, html
 
-# -------------------------------------------------
-# Secrets / API key
-# -------------------------------------------------
+# ---------------------------------------------------------------------------
+# API key
+# ---------------------------------------------------------------------------
+
 API_KEY = os.getenv("CH_API_KEY", "")
 try:
     import streamlit as st  # type: ignore
@@ -37,16 +36,17 @@ def _cache_data(**kwargs):
         return _wrap
     return st.cache_data(**kwargs)  # type: ignore
 
+
 API_BASE = "https://api.company-information.service.gov.uk"
-DOC_BASE = "https://document-api.company-information.service.gov.uk"
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "CH-Boomer-Radar/0.9.1"})
+SESSION.headers.update({"User-Agent": "CH-Boomer-Radar/1.0.0"})
 
-# -------------------------------------------------
-# Throttle (~600 requests / 5 min)
-# -------------------------------------------------
-_WINDOW = 300.0
+# ---------------------------------------------------------------------------
+# Throttling
+# ---------------------------------------------------------------------------
+
+_WINDOW = 300.0  # seconds
 _LIMIT = 580
 _REQ_TIMES: deque = deque()
 
@@ -80,9 +80,6 @@ def _request(method: str, url: str, **kwargs) -> requests.Response:
     return resp
 
 
-# -------------------------------------------------
-# Cached GET to Companies House
-# -------------------------------------------------
 @_cache_data(ttl=3600, show_spinner=False)
 def _ch_get_cached(path: str, params_key: Tuple[Tuple[str, Any], ...]) -> Dict[str, Any]:
     url = f"{API_BASE}{path}"
@@ -98,9 +95,11 @@ def ch_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
     return _ch_get_cached(path, params_key)
 
 
-# -------------------------------------------------
+# ---------------------------------------------------------------------------
 # Companies House endpoints
-# -------------------------------------------------
+# ---------------------------------------------------------------------------
+
+
 def advanced_search_by_sic(
     sic_codes: List[str],
     size: int = 100,
@@ -109,7 +108,12 @@ def advanced_search_by_sic(
 ) -> Dict[str, Any]:
     return ch_get(
         "/advanced-search/companies",
-        {"sic_codes": ",".join(sic_codes), "size": size, "start_index": start_index, "company_status": company_status},
+        {
+            "sic_codes": ",".join(sic_codes),
+            "size": size,
+            "start_index": start_index,
+            "company_status": company_status,
+        },
     )
 
 
@@ -118,7 +122,10 @@ def get_company_profile(company_number: str) -> Dict[str, Any]:
 
 
 def get_directors(company_number: str) -> List[Dict[str, Any]]:
-    data = ch_get(f"/company/{company_number}/officers", {"items_per_page": 100, "order_by": "appointed_on"})
+    data = ch_get(
+        f"/company/{company_number}/officers",
+        {"items_per_page": 100, "order_by": "appointed_on"},
+    )
     out: List[Dict[str, Any]] = []
     for it in data.get("items") or []:
         if it.get("officer_role") != "director":
@@ -129,32 +136,11 @@ def get_directors(company_number: str) -> List[Dict[str, Any]]:
     return out
 
 
-def get_psc(company_number: str) -> List[Dict[str, Any]]:
-    data = ch_get(f"/company/{company_number}/persons-with-significant-control", {"items_per_page": 100})
-    out: List[Dict[str, Any]] = []
-    for it in data.get("items") or []:
-        if it.get("ceased_on"):
-            continue
-        if it.get("kind") != "individual-person-with-significant-control":
-            continue
-        out.append({"name": it.get("name"), "dob": it.get("date_of_birth") or {}})
-    return out
-
-
-@_cache_data(ttl=3600, show_spinner=False)
-def get_outstanding_charges_count(company_number: str) -> Optional[int]:
-    """Count outstanding charges; returns None if endpoint fails."""
-    try:
-        data = ch_get(f"/company/{company_number}/charges")
-        items = data.get("items") or []
-        return sum(1 for c in items if (c.get("status") or "").lower() == "outstanding")
-    except Exception:
-        return None
-
-
-# -------------------------------------------------
+# ---------------------------------------------------------------------------
 # Helpers
-# -------------------------------------------------
+# ---------------------------------------------------------------------------
+
+
 def approx_age(dob: Optional[Dict[str, int]]) -> Optional[int]:
     if not dob or "year" not in dob:
         return None
@@ -169,97 +155,11 @@ def months_between(d1: dt.date, d2: dt.date) -> int:
     return (d2.year - d1.year) * 12 + (d2.month - d1.month) - (1 if d2.day < d1.day else 0)
 
 
-TURNOVER_TAGS = [
-    "Turnover",
-    "TurnoverRevenue",
-    "Revenue",
-    "Sales",
-    "RevenueFromContractWithCustomerExcludingAssessedTax",
-    "RevenueFromContractWithCustomerIncludingAssessedTax",
-]
-PROFIT_TAGS = [
-    "ProfitLoss",
-    "ProfitLossForPeriod",
-    "ProfitLossOnOrdinaryActivitiesBeforeTax",
-    "ProfitLossOnOrdinaryActivitiesAfterTax",
-]
-EMPLOYEE_TAGS = [
-    "AverageNumberEmployeesDuringPeriod",
-    "AverageNumberOfEmployeesDuringThePeriod",
-    "AverageNumberOfEmployees",
-]
-
-
-def _num(s: Any) -> Optional[float]:
-    if s is None:
-        return None
-    try:
-        return float(str(s).replace(",", "").strip())
-    except Exception:
-        return None
-
-
-# --------- cached doc fetch ----------
-@_cache_data(ttl=43200, show_spinner=False)
-def _doc_fetch_content_cached(document_id: str) -> Tuple[Optional[bytes], Optional[str]]:
-    meta = _request("GET", f"{DOC_BASE}/document/{document_id}").json()
-    resources = meta.get("resources") or {}
-    for mime in ("application/xhtml+xml", "text/html", "application/pdf"):
-        res = resources.get(mime)
-        if not res:
-            continue
-        url = res.get("links", {}).get("self")
-        if not url:
-            continue
-        resp = _request("GET", f"{DOC_BASE}{url}")
-        if resp.is_redirect and resp.headers.get("Location"):
-            resp = SESSION.get(resp.headers["Location"], timeout=60)
-        if resp.status_code < 400:
-            return resp.content, mime
-    return None, None
-
-
-def extract_financials(company_number: str) -> Dict[str, Any]:
-    out: Dict[str, Any] = {"turnover": None, "profit": None, "employees": None}
-    fh = ch_get(f"/company/{company_number}/filing-history", {"category": "accounts", "items_per_page": 50})
-    doc_id: Optional[str] = None
-    for it in fh.get("items") or []:
-        meta_url = (it.get("links") or {}).get("document_metadata")
-        if meta_url and "/document/" in meta_url:
-            doc_id = meta_url.rsplit("/document/", 1)[-1]
-            break
-    if not doc_id:
-        return out
-    content, mime = _doc_fetch_content_cached(doc_id)
-    if not content or mime == "application/pdf":
-        return out
-    try:
-        root = html.fromstring(content)
-    except Exception:
-        try:
-            root = etree.fromstring(content)
-        except Exception:
-            return out
-
-    def pick(tags: List[str]) -> Optional[float]:
-        xp = "|".join([f".//*[local-name()='{t}']" for t in tags])
-        if not xp:
-            return None
-        for n in root.xpath(xp):
-            v = _num((n.text or "").strip())
-            if v is not None:
-                return v
-        return None
-
-    out["turnover"] = pick(TURNOVER_TAGS)
-    out["profit"] = pick(PROFIT_TAGS)
-    out["employees"] = pick(EMPLOYEE_TAGS)
-    return out
-
-
-# -------------------------------------------------
+# ---------------------------------------------------------------------------
 # Geo / Radius
-# -------------------------------------------------
+# ---------------------------------------------------------------------------
+
+
 @_cache_data(ttl=86400, show_spinner=False)
 def _postcodes_bulk_cached(chunk: Tuple[str, ...]) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
     out: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
@@ -338,230 +238,152 @@ def filter_by_radius(rows: List[Dict[str, Any]], centre_postcode: str, radius_km
     return out
 
 
-# -------------------------------------------------
+# ---------------------------------------------------------------------------
 # Main search
-# -------------------------------------------------
+# ---------------------------------------------------------------------------
+
+
 def find_targets(
     sic_codes: List[str],
-    min_age: int = 55,
-    max_directors: int = 2,
-    size: int = 100,
-    pages: int = 1,
     *,
-    limit_companies: int = 120,
-    fetch_financials: bool = False,
-    financials_top_n: int = 40,
-    min_employees: int = 0,
-    min_years_trading: int = 0,
-    fetch_psc: bool = False,
-    psc_min_age: int = 0,
-    psc_max_count: int = 2,
-    # Accounts freshness
-    require_accounts_within_months: Optional[int] = None,
-    exclude_overdue_accounts: bool = False,
-    # Confirmation statement freshness
-    require_confirmation_within_months: Optional[int] = None,
-    exclude_overdue_confirmation: bool = False,
-    # Risk / Address flags
-    exclude_insolvency_history: bool = False,
-    exclude_undeliverable_address: bool = False,
-    exclude_office_in_dispute: bool = False,
-    # Charges
-    fetch_charges_count: bool = False,
-    charges_top_n: int = 50,
-    max_outstanding_charges: Optional[int] = None,
+    min_age: int = 63,
+    max_directors: int = 2,
+    min_years_trading: int = 10,
+    size: int = 100,
+    start_page: int = 0,
+    max_companies: int = 200,
 ) -> List[Dict[str, Any]]:
     """
-    Returns list of dicts with lots of fields. Filters are applied inline to save API calls.
+    Return a list of companies that roughly match our retirement-ready profile:
+    - Active
+    - SIC in given list
+    - Director ages >= min_age
+    - At most max_directors active directors
+    - At least min_years_trading
+    - Clean risk flags
+    - Accounts & confirmation not badly overdue
     """
     results: List[Dict[str, Any]] = []
-    start_index = 0
-    processed = 0
     today = dt.date.today()
 
-    for _ in range(pages):
-        items = advanced_search_by_sic(sic_codes, size=size, start_index=start_index).get("items") or []
-        if not items:
+    start_index = start_page * size
+    data = advanced_search_by_sic(sic_codes, size=size, start_index=start_index)
+    items = data.get("items") or []
+    if not items:
+        return results
+
+    for c in items:
+        if len(results) >= max_companies:
             break
-        for c in items:
-            if processed >= limit_companies:
-                return results
 
-            cnum = c.get("company_number")
-            created = c.get("date_of_creation")
-            years: Optional[int] = None
-            if created:
-                try:
-                    y, m, d = map(int, created.split("-"))
-                    t = today
-                    years = t.year - y - ((t.month, t.day) < (m, d))
-                except Exception:
-                    years = None
-            if min_years_trading and (years is None or years < min_years_trading):
-                continue
+        cnum = c.get("company_number")
+        if not cnum:
+            continue
 
-            # Active directors & ages
-            directors = get_directors(cnum)
-            if not directors or len(directors) > max_directors:
-                continue
-            dir_ages = [approx_age(d.get("dob")) for d in directors]
-            if any((a is None) or (a < min_age) for a in dir_ages):
-                continue
-            avg_dir_age: Optional[float] = round(
-                sum(a for a in dir_ages if a is not None) / len(dir_ages), 1
-            ) if dir_ages else None
+        created = c.get("date_of_creation")
+        years_trading: Optional[int] = None
+        if created:
+            try:
+                y, m, d = map(int, created.split("-"))
+                created_date = dt.date(y, m, d)
+                years_trading = today.year - y - ((today.month, today.day) < (m, d))
+            except Exception:
+                years_trading = None
+        if (years_trading is None) or (years_trading < min_years_trading):
+            continue
 
-            # Profile for address + accounts + confirmation + flags
-            prof = get_company_profile(cnum)
-            ro = prof.get("registered_office_address") or {}
-            pc = ro.get("postal_code") or ro.get("postcode")
+        # Directors & ages
+        directors = get_directors(cnum)
+        if not directors or len(directors) > max_directors:
+            continue
+        dir_ages = [approx_age(d.get("dob")) for d in directors]
+        if any(a is None or a < min_age for a in dir_ages):
+            continue
+        valid_ages = [a for a in dir_ages if a is not None]
+        avg_dir_age = round(sum(valid_ages) / len(valid_ages), 1) if valid_ages else None
 
-            # Risk flags
-            has_insolvency = bool(prof.get("has_insolvency_history"))
-            has_charges_flag = bool(prof.get("has_charges"))
-            undeliverable_ro = bool(prof.get("undeliverable_registered_office_address"))
-            office_in_dispute = bool(prof.get("registered_office_is_in_dispute"))
+        # Company profile
+        prof = get_company_profile(cnum)
+        ro = prof.get("registered_office_address") or {}
+        pc = ro.get("postal_code") or ro.get("postcode")
 
-            if exclude_insolvency_history and has_insolvency:
-                processed += 1
-                continue
-            if exclude_undeliverable_address and undeliverable_ro:
-                processed += 1
-                continue
-            if exclude_office_in_dispute and office_in_dispute:
-                processed += 1
-                continue
+        # Risk flags
+        has_insolvency = bool(prof.get("has_insolvency_history"))
+        undeliverable_ro = bool(prof.get("undeliverable_registered_office_address"))
+        office_in_dispute = bool(prof.get("registered_office_is_in_dispute"))
 
-            # Accounts freshness
-            accounts = prof.get("accounts") or {}
-            la = accounts.get("last_accounts") or {}
-            last_made = la.get("made_up_to") or la.get("period_end_on")
-            last_made_date: Optional[dt.date] = None
-            if last_made:
-                try:
-                    y, m, d = map(int, str(last_made).split("-"))
-                    last_made_date = dt.date(y, m, d)
-                except Exception:
-                    pass
-            months_since_accounts: Optional[int] = None
-            if last_made_date:
-                months_since_accounts = months_between(last_made_date, today)
-            accounts_overdue = bool(accounts.get("overdue") or (accounts.get("next_accounts") or {}).get("overdue"))
-            next_accounts_due = (accounts.get("next_accounts") or {}).get("due_on") or (accounts.get("next_accounts") or {}).get("next_due")
+        if has_insolvency or undeliverable_ro or office_in_dispute:
+            continue
 
-            if exclude_overdue_accounts and accounts_overdue:
-                processed += 1
-                continue
-            if require_accounts_within_months is not None:
-                if (months_since_accounts is None) or (months_since_accounts > int(require_accounts_within_months)):
-                    processed += 1
-                    continue
+        # Accounts
+        accounts = prof.get("accounts") or {}
+        la = accounts.get("last_accounts") or {}
+        last_made = la.get("made_up_to") or la.get("period_end_on")
+        last_accounts_date: Optional[dt.date] = None
+        if last_made:
+            try:
+                y, m, d = map(int, str(last_made).split("-"))
+                last_accounts_date = dt.date(y, m, d)
+            except Exception:
+                pass
 
-            # Confirmation statement freshness
-            conf = prof.get("confirmation_statement") or {}
-            conf_last = conf.get("last_made_up_to")
-            conf_last_date: Optional[dt.date] = None
-            if conf_last:
-                try:
-                    y, m, d = map(int, str(conf_last).split("-"))
-                    conf_last_date = dt.date(y, m, d)
-                except Exception:
-                    pass
-            months_since_conf: Optional[int] = None
-            if conf_last_date:
-                months_since_conf = months_between(conf_last_date, today)
-            conf_overdue = bool(conf.get("overdue"))
-            conf_next_due = conf.get("next_due")
+        months_since_accounts: Optional[int] = None
+        if last_accounts_date:
+            months_since_accounts = months_between(last_accounts_date, today)
 
-            if exclude_overdue_confirmation and conf_overdue:
-                processed += 1
-                continue
-            if require_confirmation_within_months is not None:
-                if (months_since_conf is None) or (months_since_conf > int(require_confirmation_within_months)):
-                    processed += 1
-                    continue
+        accounts_overdue = bool(accounts.get("overdue") or (accounts.get("next_accounts") or {}).get("overdue"))
 
-            # Financials (optional; best-effort iXBRL)
-            fin: Dict[str, Any] = {"turnover": None, "profit": None, "employees": None}
-            if fetch_financials and processed < financials_top_n:
-                fin = extract_financials(cnum)
-                if min_employees and fin.get("employees") is not None and fin["employees"] < min_employees:
-                    processed += 1
-                    continue
+        # Confirmation statement
+        conf = prof.get("confirmation_statement") or {}
+        conf_last = conf.get("last_made_up_to")
+        conf_last_date: Optional[dt.date] = None
+        if conf_last:
+            try:
+                y, m, d = map(int, str(conf_last).split("-"))
+                conf_last_date = dt.date(y, m, d)
+            except Exception:
+                pass
 
-            # PSC ages
-            avg_psc_age: Optional[float] = None
-            psc_ages: List[int] = []
-            psc_count: Optional[int] = None
-            if fetch_psc:
-                pscs = get_psc(cnum)
-                psc_count = len(pscs)
-                psc_ages = [a for a in (approx_age(p.get("dob")) for p in pscs) if a is not None]
-                if psc_max_count and (psc_count is not None) and psc_count > psc_max_count:
-                    processed += 1
-                    continue
-                if psc_min_age and (not psc_ages or any(a < psc_min_age for a in psc_ages)):
-                    processed += 1
-                    continue
-                if psc_ages:
-                    avg_psc_age = round(sum(psc_ages) / len(psc_ages), 1)
+        months_since_conf: Optional[int] = None
+        if conf_last_date:
+            months_since_conf = months_between(conf_last_date, today)
 
-            # Charges (optional)
-            outstanding_charges: Optional[int] = None
-            if fetch_charges_count and processed < charges_top_n:
-                outstanding_charges = get_outstanding_charges_count(cnum)
-                if (max_outstanding_charges is not None) and (outstanding_charges is not None):
-                    if outstanding_charges > int(max_outstanding_charges):
-                        processed += 1
-                        continue
+        conf_overdue = bool(conf.get("overdue"))
 
-            ch_link = f"https://find-and-update.company-information.service.gov.uk/company/{cnum}"
-            google = f"https://www.google.com/search?q={quote_plus((c.get('company_name') or '') + ' ' + (pc or ''))}"
+        # Simple freshness rules: ignore badly overdue or missing
+        if accounts_overdue or (months_since_accounts is None) or months_since_accounts > 36:
+            continue
+        if conf_overdue or (months_since_conf is None) or months_since_conf > 36:
+            continue
 
-            results.append(
-                {
-                    "company_number": cnum,
-                    "company_name": c.get("company_name"),
-                    "incorporated": created,
-                    "years_trading": years,
-                    "sic_codes": ",".join(c.get("sic_codes", [])),
-                    "active_directors": len(directors),
-                    "director_ages": ",".join(str(a) for a in dir_ages if a is not None),
-                    "avg_director_age": avg_dir_age,
-                    "avg_psc_age": avg_psc_age,
-                    "postcode": pc,
-                    # financials
-                    "turnover": fin.get("turnover"),
-                    "profit": fin.get("profit"),
-                    "employees": fin.get("employees"),
-                    # PSC
-                    "psc_count": psc_count,
-                    "psc_ages": ",".join(map(str, psc_ages)) if psc_ages else None,
-                    # accounts
-                    "last_accounts_made_up_to": str(last_made_date) if last_made_date else None,
-                    "months_since_accounts": months_since_accounts,
-                    "accounts_overdue": accounts_overdue,
-                    "next_accounts_due": next_accounts_due,
-                    # confirmation statement
-                    "confirmation_last_made_up_to": str(conf_last_date) if conf_last_date else None,
-                    "months_since_confirmation": months_since_conf,
-                    "confirmation_overdue": conf_overdue,
-                    "next_confirmation_due": conf_next_due,
-                    # risk flags
-                    "has_insolvency_history": has_insolvency,
-                    "has_charges": has_charges_flag,
-                    "undeliverable_registered_office_address": undeliverable_ro,
-                    "registered_office_is_in_dispute": office_in_dispute,
-                    # charges count
-                    "outstanding_charges": outstanding_charges,
-                    # links
-                    "ch_link": ch_link,
-                    "google": google,
-                }
-            )
-            processed += 1
-            time.sleep(0.02)
+        ch_link = f"https://find-and-update.company-information.service.gov.uk/company/{cnum}"
+        google = f"https://www.google.com/search?q={quote_plus((c.get('company_name') or '') + ' ' + (pc or ''))}"
 
-        start_index += size
+        results.append(
+            {
+                "company_number": cnum,
+                "company_name": c.get("company_name"),
+                "incorporated": created,
+                "years_trading": years_trading,
+                "sic_codes": ",".join(c.get("sic_codes", [])),
+                "active_directors": len(directors),
+                "director_ages": ",".join(str(a) for a in dir_ages if a is not None),
+                "avg_director_age": avg_dir_age,
+                "postcode": pc,
+                "last_accounts_made_up_to": str(last_accounts_date) if last_accounts_date else None,
+                "months_since_accounts": months_since_accounts,
+                "accounts_overdue": accounts_overdue,
+                "confirmation_last_made_up_to": str(conf_last_date) if conf_last_date else None,
+                "months_since_confirmation": months_since_conf,
+                "confirmation_overdue": conf_overdue,
+                "has_insolvency_history": has_insolvency,
+                "undeliverable_registered_office_address": undeliverable_ro,
+                "registered_office_is_in_dispute": office_in_dispute,
+                "ch_link": ch_link,
+                "google": google,
+            }
+        )
+
+        time.sleep(0.02)
 
     return results
