@@ -1,12 +1,13 @@
-# app.py — Boomer Radar
-# Polished UI + Boomer Score + Map + Outreach + Accounts/Confirmation freshness
-# + Risk flags + Outstanding charges + Shortlist/Notes + robust dtype handling for data_editor
+# app.py — Boomer Radar (simplified v1)
+# Focused on: older owners, long trading history, local radius, curated SICs
+# Simple UI, clean results, score column, CSV export.
 
 import math
 import urllib.parse as ul
+from typing import Dict, List
+
 import pandas as pd
 import streamlit as st
-import pydeck as pdk
 
 from ch_retirement_finder import (
     find_targets,
@@ -14,387 +15,349 @@ from ch_retirement_finder import (
     geocode_rows,
 )
 
+# ---------------------------------------------------------------------------
+# Page & global styles
+# ---------------------------------------------------------------------------
+
 st.set_page_config(page_title="Boomer Radar", page_icon="🎯", layout="wide")
 
-# --------- Global styles (extra top padding so title isn't clipped) ----------
 st.markdown(
     """
 <style>
-section[data-testid="stSidebar"] { border-right: 1px solid #e9e9ef; }
-.block-container { padding-top: 2.4rem !important; padding-bottom: 2rem; }
-.kpi { padding:12px 16px; border-radius:14px; background:#f7f7fb; border:1px solid #ececf2; }
-.kpi h3 { margin:0; font-size:1.8rem; line-height:1.1; }
-.kpi small { color:#667085; }
+/* Layout */
+.block-container {
+    padding-top: 2rem !important;
+    padding-bottom: 2rem !important;
+    max-width: 1200px;
+}
+
+/* Sidebar */
+section[data-testid="stSidebar"] {
+    border-right: 1px solid #e5e7eb;
+    background: #f8fafc;
+}
+section[data-testid="stSidebar"] .block-container {
+    padding-top: 1.5rem !important;
+}
+
+/* Page title area */
+.boomer-header {
+    padding: 18px 22px;
+    border-radius: 18px;
+    background: linear-gradient(135deg, #0f172a, #1d4ed8);
+    color: #f9fafb;
+    margin-bottom: 18px;
+}
+.boomer-header h1 {
+    font-size: 1.8rem;
+    margin: 0 0 4px 0;
+}
+.boomer-header p {
+    margin: 0;
+    opacity: 0.8;
+    font-size: 0.95rem;
+}
+
+/* KPI cards */
+.kpi-row {
+    margin-bottom: 12px;
+}
+.kpi {
+    padding: 12px 16px;
+    border-radius: 16px;
+    background: #ffffff;
+    border: 1px solid #e5e7eb;
+    box-shadow: 0 8px 18px rgba(15, 23, 42, 0.03);
+}
+.kpi h3 {
+    margin: 2px 0 0 0;
+    font-size: 1.4rem;
+    line-height: 1.1;
+    color: #0f172a;
+}
+.kpi small {
+    color: #6b7280;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-size: 0.72rem;
+}
+
+/* Data table tweaks */
+[data-testid="stDataFrame"] {
+    border-radius: 14px;
+    overflow: hidden;
+    border: 1px solid #e5e7eb;
+    box-shadow: 0 10px 24px rgba(15, 23, 42, 0.04);
+}
+
+/* Buttons */
+.stButton button {
+    border-radius: 999px;
+    border: 1px solid #1d4ed8;
+    background: #1d4ed8;
+    color: #f9fafb;
+    padding: 0.4rem 1.2rem;
+    font-weight: 500;
+}
+.stButton button:hover {
+    background: #1e40af;
+    border-color: #1e40af;
+}
 </style>
 """,
     unsafe_allow_html=True,
 )
+
+st.markdown(
+    """
+<div class="boomer-header">
+  <h1>🎯 Boomer Radar</h1>
+  <p>Find retirement-ready owners of boring, stable manufacturing and industrial businesses near WA14.</p>
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
+# ---------------------------------------------------------------------------
+# Curated SIC groups (boring, stable, non-AI / physical work)
 # ---------------------------------------------------------------------------
 
-st.markdown("### 🎯 Boomer Radar — Companies House deal finder")
 
-# session state for shortlist/notes persistence
-if "shortlist_map" not in st.session_state:
-    st.session_state.shortlist_map = {}
-if "notes_map" not in st.session_state:
-    st.session_state.notes_map = {}
+def sic_groups() -> Dict[str, List[str]]:
+    return {
+        "Fabrication & metalwork": [
+            "25110", "25120", "25290", "25610", "25620", "25990", "24540",
+        ],
+        "Machinery & engineering": [
+            "28220", "28290", "28410", "28490", "28990", "33120", "33140", "33200",
+        ],
+        "Plastics & packaging": [
+            "22210", "22220", "22230", "22290", "17230", "17290",
+        ],
+        "Electrical & components": [
+            "27120", "27900", "26511",
+        ],
+        "Industrial / trade supply": [
+            "46620", "46690", "46720", "46740", "46900", "46130", "46730",
+        ],
+        "Automotive parts & filters": [
+            "29320", "45310", "45320",
+        ],
+        "Joinery / wood products": [
+            "16230", "16240",
+        ],
+        "Other boring manufacturing": [
+            "20412", "20590", "32990", "38320",
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Sidebar controls
+# ---------------------------------------------------------------------------
 
 with st.sidebar:
-    st.header("Search Filters")
-    sic_str = st.text_input(
-        "SIC codes (space or comma separated)",
-        value="10110 10710 22220 25110 25620 25990 33120 33200",
+    st.header("Search filters")
+
+    # Geography
+    st.subheader("Location")
+    centre_pc = st.text_input("Centre postcode", value="WA14 4YU")
+    radius_km = st.slider("Radius (km)", min_value=5, max_value=50, value=25, step=5)
+
+    st.subheader("Owner & business profile")
+    min_age = st.number_input("Minimum director age", min_value=55, max_value=80, value=63)
+    max_directors = st.number_input("Max active directors", min_value=1, max_value=4, value=2)
+    min_years_trading = st.slider("Minimum years trading", 0, 40, 10)
+
+    st.subheader("Industries (SIC groups)")
+    selected_sics: List[str] = []
+    for group_name, codes in sic_groups().items():
+        checked = st.checkbox(f"{group_name} ({', '.join(codes)})", value=True)
+        if checked:
+            selected_sics.extend(codes)
+
+    st.subheader("Companies House results page")
+    page_number = st.number_input(
+        "Advanced search page (0 = first page)",
+        min_value=0,
+        max_value=999,
+        value=0,
+        step=1,
+        help="Use this to move through the CH advanced search results.",
     )
-    min_age = st.number_input("Minimum director age", min_value=50, max_value=90, value=55)
-    max_directors = st.number_input("Max active directors", min_value=1, max_value=5, value=2)
-    min_years_trading = st.slider("Min years trading", 0, 40, 10)
 
-    st.divider()
-    st.subheader("Accounts freshness")
-    require_recent_accts = st.checkbox("Must have filed accounts recently", value=False)
-    months_accts = st.slider("Max months since last accounts", 6, 36, 18)
-    exclude_overdue_accts = st.checkbox("Exclude overdue accounts", value=True)
+    run_search = st.button("Run search", use_container_width=True)
 
-    st.subheader("Confirmation statement")
-    require_recent_conf = st.checkbox("Must have a recent confirmation statement", value=False)
-    months_conf = st.slider("Max months since confirmation", 6, 36, 13)
-    exclude_overdue_conf = st.checkbox("Exclude overdue confirmation", value=True)
-
-    st.divider()
-    st.subheader("Risk & charges")
-    exclude_insolvency = st.checkbox("Exclude with insolvency history", value=True)
-    exclude_undeliverable = st.checkbox("Exclude undeliverable office address", value=True)
-    exclude_dispute = st.checkbox("Exclude office in dispute", value=True)
-
-    fetch_charges = st.checkbox("Fetch outstanding charges count (slower)", value=False)
-    charges_top_n = st.slider("Only check charges for first N companies", 10, 120, 60, step=10)
-    max_charges = st.slider("Max outstanding charges allowed", 0, 10, 2)
-
-    st.divider()
-    st.subheader("Rate-limit safe")
-    limit_companies = st.slider("Max companies to scan", 20, 200, 120, step=10)
-    size = st.slider("Advanced search page size", 50, 500, 100, step=50)
-    pages = st.slider("Pages to fetch", 1, 10, 1)
-
-    st.divider()
-    st.subheader("Financials (iXBRL best-effort)")
-    fetch_financials = st.checkbox("Fetch turnover/profit & employees (slower)", value=False)
-    financials_top_n = st.slider("Only fetch for first N companies", 10, 100, 40, step=10)
-    min_employees = st.slider("Min employees (if known)", 0, 500, 0, step=5)
-
-    st.divider()
-    st.subheader("Owners (PSC)")
-    fetch_psc = st.checkbox("Check PSC owners", value=False)
-    psc_min_age = st.slider("PSC min age", 0, 90, 55)
-    psc_max_count = st.slider("PSC max count", 1, 5, 2)
-
-    st.divider()
-    st.subheader("Radius (optional)")
-    centre_pc = st.text_input("Centre postcode (e.g. WA13 0AG)", value="")
-    radius_km = st.number_input("Radius in km", min_value=1, max_value=200, value=25)
-
-    st.divider()
-    st.subheader("Boomer Score weights")
-    w_dir = st.slider("Director age", 0.0, 5.0, 4.0, 0.5)
-    w_psc = st.slider("PSC age", 0.0, 5.0, 3.0, 0.5)
-    w_year = st.slider("Years trading", 0.0, 5.0, 3.0, 0.5)
-    w_emp = st.slider("Employees", 0.0, 5.0, 2.0, 0.5)
-    w_turn = st.slider("Turnover", 0.0, 5.0, 1.0, 0.5)
-    w_dist = st.slider("Nearness (closer=better)", 0.0, 5.0, 2.0, 0.5)
-
-    st.divider()
-    st.subheader("Outreach template")
-    your_name = st.text_input("Your name", value="Mike")
-    your_company = st.text_input("Your company", value="Acquirer Ltd")
-    your_phone = st.text_input("Phone", value="")
-    tone = st.selectbox("Tone", ["Friendly", "Professional", "Direct"])
-
-    run = st.button("Run search", use_container_width=True)
-
-# --------- Helpers ---------
-def _norm(x, lo, hi):
-    if x is None or (isinstance(x, float) and math.isnan(x)):
-        return None
-    if hi == lo:
-        return 0.0
-    v = max(lo, min(hi, float(x)))
-    return (v - lo) / (hi - lo)
+# ---------------------------------------------------------------------------
+# Helper: scoring for prioritisation (0–100)
+# ---------------------------------------------------------------------------
 
 
-def add_boomer_score(df: pd.DataFrame, radius_used: float or None):
-    dir_age = df["avg_director_age"].apply(lambda a: _norm(a, 55, 85))
-    psc_age = df["avg_psc_age"].where(df["avg_psc_age"].notna(), df["avg_director_age"]).apply(lambda a: _norm(a, 55, 85))
-    years = df["years_trading"].apply(lambda y: _norm(y, 5, 30))
-    emps = df["employees"].apply(lambda e: _norm(e, 1, 100))
-    turn = df["turnover"].apply(lambda t: _norm(t, 100_000, 5_000_000))
-    if radius_used and "distance_km" in df.columns:
-        near = df["distance_km"].apply(lambda d: None if pd.isna(d) else max(0.0, 1.0 - min(float(d) / float(radius_used), 1.0)))
+def compute_score_row(row, radius_used: float) -> float:
+    score = 0.0
+
+    # Director age: reward 63–75
+    age = row.get("avg_director_age")
+    if isinstance(age, (int, float)):
+        if age >= 75:
+            score += 40
+        elif age >= 63:
+            score += 25 + (age - 63) * 1.2  # gentle ramp
+
+    # Years trading: reward 10–40
+    yrs = row.get("years_trading")
+    if isinstance(yrs, (int, float)):
+        if yrs >= 30:
+            score += 30
+        elif yrs >= 10:
+            score += 15 + (yrs - 10) * 0.75
+
+    # Distance: closer is better
+    dist = row.get("distance_km")
+    if isinstance(dist, (int, float)) and radius_used > 0:
+        if dist <= radius_used / 2:
+            score += 20
+        elif dist <= radius_used:
+            score += 10
+
+    # Filings freshness (accounts & confirmation)
+    if not row.get("accounts_overdue") and not row.get("confirmation_overdue"):
+        score += 10
+
+    return round(min(score, 100.0), 1)
+
+
+# ---------------------------------------------------------------------------
+# Main search + results
+# ---------------------------------------------------------------------------
+
+if run_search:
+    if not selected_sics:
+        st.warning("Please keep at least one SIC group selected.")
     else:
-        near = pd.Series([None] * len(df))
-    weights = [w_dir, w_psc, w_year, w_emp, w_turn, w_dist]
-    parts = [dir_age, psc_age, years, emps, turn, near]
-    parts = [p.fillna(0.0) for p in parts]
-    total_w = sum(weights) if sum(weights) > 0 else 1.0
-    score = 100.0 * sum(w * p for w, p in zip(weights, parts)) / total_w
-    df["boomer_score"] = score.round(1)
-    return df
+        with st.spinner("Querying Companies House…"):
+            rows = find_targets(
+                selected_sics,
+                min_age=int(min_age),
+                max_directors=int(max_directors),
+                min_years_trading=int(min_years_trading),
+                size=100,
+                start_page=int(page_number),
+                max_companies=200,
+            )
 
-
-def build_email(company_name, ch_link, your_name, your_company, your_phone, tone):
-    subj = f"Succession / exit option for {company_name}"
-    if tone == "Friendly":
-        body = (
-            f"Hi,\n\nI run {your_company}. We're looking to take over well-run businesses from owners "
-            f"thinking about retirement. If you'd ever consider an exit or management handover, could we chat?\n\n"
-            f"Companies House link: {ch_link}\n"
-            f"{('Phone: ' + your_phone + '\\n') if your_phone else ''}"
-            f"Best,\n{your_name}"
-        )
-    elif tone == "Direct":
-        body = (
-            f"Hello,\n\nI represent {your_company}. We acquire profitable businesses with experienced owners "
-            f"planning succession. Would you be open to a confidential conversation?\n\n{ch_link}\n\n"
-            f"Regards,\n{your_name}{(' | ' + your_phone) if your_phone else ''}"
-        )
-    else:
-        body = (
-            f"Hello,\n\nI'm {your_name} from {your_company}. We specialise in succession purchases for established "
-            f"firms. If an ownership transition is on your mind, I'd welcome a short call.\n\n"
-            f"Company profile: {ch_link}\n\nKind regards,\n{your_name}{(' | ' + your_phone) if your_phone else ''}"
-        )
-    return subj, body
-
-
-# ---------------------------
-
-if run:
-    sic_codes = [s.strip() for part in sic_str.split(",") for s in part.split() if s.strip()]
-    with st.spinner("Querying Companies House… (throttled & cached)"):
-        rows = find_targets(
-            sic_codes,
-            min_age=int(min_age),
-            max_directors=int(max_directors),
-            size=int(size),
-            pages=int(pages),
-            limit_companies=int(limit_companies),
-            fetch_financials=bool(fetch_financials),
-            financials_top_n=int(financials_top_n),
-            min_employees=int(min_employees),
-            min_years_trading=int(min_years_trading),
-            fetch_psc=bool(fetch_psc),
-            psc_min_age=int(psc_min_age),
-            psc_max_count=int(psc_max_count),
-            require_accounts_within_months=(int(months_accts) if require_recent_accts else None),
-            exclude_overdue_accounts=bool(exclude_overdue_accts),
-            require_confirmation_within_months=(int(months_conf) if require_recent_conf else None),
-            exclude_overdue_confirmation=bool(exclude_overdue_conf),
-            exclude_insolvency_history=bool(exclude_insolvency),
-            exclude_undeliverable_address=bool(exclude_undeliverable),
-            exclude_office_in_dispute=bool(exclude_dispute),
-            fetch_charges_count=bool(fetch_charges),
-            charges_top_n=int(charges_top_n),
-            max_outstanding_charges=int(max_charges) if fetch_charges else None,
-        )
-
-    # Radius filter (adds lat/lon) — or geocode all for map if no radius
-    if centre_pc.strip():
-        with st.spinner("Filtering by radius…"):
-            rows = filter_by_radius(rows, centre_pc.strip(), float(radius_km))
-    else:
-        rows = geocode_rows(rows)
-
-    if not rows:
-        st.warning("No matching companies (or none within radius). Try more pages or relax filters.")
-    else:
-        df = pd.DataFrame(rows)
-        df = add_boomer_score(df, radius_km if centre_pc.strip() else None)
-
-        # Inject shortlist/notes from session
-        df["shortlist"] = df["company_number"].map(st.session_state.shortlist_map).fillna(False).astype(bool)
-        df["notes"] = df["company_number"].map(st.session_state.notes_map).fillna("").astype(str)
-
-        # Outreach columns (subject/body + mailto: link)
-        subs, bodies, links = [], [], []
-        for _, r in df.iterrows():
-            subj, body = build_email(r["company_name"], r["ch_link"], your_name, your_company, your_phone, tone)
-            subs.append(subj)
-            bodies.append(body)
-            links.append("mailto:?subject=" + ul.quote(subj) + "&body=" + ul.quote(body))
-        df["email_subject"] = subs
-        df["email_body"] = bodies
-        df["email_link"] = links
-
-        # ---------- DTYPE FIXES FOR data_editor ----------
-        # Make sure numeric columns are numeric (not object with None/strings)
-        numeric_cols = [
-            "boomer_score", "years_trading", "avg_director_age", "psc_count", "employees",
-            "turnover", "profit", "distance_km", "months_since_accounts",
-            "months_since_confirmation", "outstanding_charges",
-        ]
-        for c in numeric_cols:
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-
-        # Map boolean-like flags to "Yes/No/—" strings so they match TextColumn
-        bool_text_cols = [
-            "accounts_overdue",
-            "confirmation_overdue",
-            "has_insolvency_history",
-            "has_charges",
-            "undeliverable_registered_office_address",
-            "registered_office_is_in_dispute",
-        ]
-        for c in bool_text_cols:
-            if c in df.columns:
-                df[c] = df[c].map(lambda x: "Yes" if x is True else ("No" if x is False else "—"))
-
-        # KPIs
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            st.markdown(f'<div class="kpi"><small>Results</small><h3>{len(df):,}</h3></div>', unsafe_allow_html=True)
-        with c2:
-            st.markdown(f'<div class="kpi"><small>Avg score</small><h3>{df["boomer_score"].mean():.1f}</h3></div>', unsafe_allow_html=True)
-        with c3:
-            st.markdown(f'<div class="kpi"><small>Avg years</small><h3>{df["years_trading"].mean():.1f}</h3></div>', unsafe_allow_html=True)
-        with c4:
-            st.markdown(f'<div class="kpi"><small>Avg dir age</small><h3>{df["avg_director_age"].mean():.1f}</h3></div>', unsafe_allow_html=True)
-
-        # Tabs: Results / Map / About
-        t1, t2, t3 = st.tabs(["📋 Results", "🗺️ Map", "ℹ️ About"])
-
-        with t1:
-            show_shortlist_only = st.checkbox("Show shortlist only", value=False)
-            if show_shortlist_only:
-                df_view = df[df["shortlist"] == True].copy()  # noqa: E712
+        # Radius filtering / geocoding
+        if not rows:
+            st.info(
+                "No companies matched your filters on this page. "
+                "Try lowering director age, reducing years trading, widening radius or trying a different page."
+            )
+        else:
+            if centre_pc.strip():
+                with st.spinner("Filtering by radius…"):
+                    rows = filter_by_radius(rows, centre_pc.strip(), float(radius_km))
             else:
-                df_view = df.copy()
+                rows = geocode_rows(rows)
 
-            view_cols = [
-                "shortlist",
-                "boomer_score",
-                "company_name",
-                "company_number",
-                "years_trading",
-                "avg_director_age",
-                "psc_count",
-                "employees",
-                "turnover",
-                "profit",
-                "postcode",
-                "distance_km",
-                # accounts & confirmation freshness
-                "last_accounts_made_up_to",
-                "months_since_accounts",
-                "accounts_overdue",
-                "next_accounts_due",
-                "confirmation_last_made_up_to",
-                "months_since_confirmation",
-                "confirmation_overdue",
-                "next_confirmation_due",
-                # risk flags & charges
-                "has_insolvency_history",
-                "has_charges",
-                "outstanding_charges",
-                "undeliverable_registered_office_address",
-                "registered_office_is_in_dispute",
-                # links & outreach
-                "ch_link",
-                "google",
-                "email_link",
-                "notes",
-            ]
-            for c in view_cols:
-                if c not in df_view.columns:
-                    df_view[c] = None
-
-            # Editable shortlist + notes (all other columns disabled)
-            edited = st.data_editor(
-                df_view[view_cols].sort_values("boomer_score", ascending=False),
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "shortlist": st.column_config.CheckboxColumn("⭐", help="Add to shortlist"),
-                    "boomer_score": st.column_config.NumberColumn("Boomer score", format="%.1f", disabled=True),
-                    "years_trading": st.column_config.NumberColumn("Years", format="%.0f", disabled=True),
-                    "avg_director_age": st.column_config.NumberColumn("Dir age (avg)", format="%.0f", disabled=True),
-                    "psc_count": st.column_config.NumberColumn("PSC", format="%.0f", disabled=True),
-                    "employees": st.column_config.NumberColumn("Employees", format="%.0f", disabled=True),
-                    "turnover": st.column_config.NumberColumn("Turnover", format="£%0.0f", disabled=True),
-                    "profit": st.column_config.NumberColumn("Profit", format="£%0.0f", disabled=True),
-                    "postcode": st.column_config.TextColumn("Postcode", disabled=True),
-                    "distance_km": st.column_config.NumberColumn("Km away", format="%.1f", disabled=True),
-                    "last_accounts_made_up_to": st.column_config.TextColumn("Last accounts", disabled=True),
-                    "months_since_accounts": st.column_config.NumberColumn("Months since", disabled=True),
-                    "accounts_overdue": st.column_config.TextColumn("Overdue?", disabled=True),
-                    "next_accounts_due": st.column_config.TextColumn("Next due", disabled=True),
-                    "confirmation_last_made_up_to": st.column_config.TextColumn("Last confirmation", disabled=True),
-                    "months_since_confirmation": st.column_config.NumberColumn("Months since conf", disabled=True),
-                    "confirmation_overdue": st.column_config.TextColumn("Conf overdue?", disabled=True),
-                    "next_confirmation_due": st.column_config.TextColumn("Next conf due", disabled=True),
-                    "has_insolvency_history": st.column_config.TextColumn("Insolvency?", disabled=True),
-                    "has_charges": st.column_config.TextColumn("Has charges?", disabled=True),
-                    "outstanding_charges": st.column_config.NumberColumn("Outstanding charges", disabled=True),
-                    "undeliverable_registered_office_address": st.column_config.TextColumn("RO undeliverable?", disabled=True),
-                    "registered_office_is_in_dispute": st.column_config.TextColumn("RO in dispute?", disabled=True),
-                    "ch_link": st.column_config.LinkColumn("Companies House", display_text="Open", disabled=True),
-                    "google": st.column_config.LinkColumn("Google", display_text="Search", disabled=True),
-                    "email_link": st.column_config.LinkColumn("Email", display_text="Compose", disabled=True),
-                    "notes": st.column_config.TextColumn("Notes"),
-                },
-            )
-
-            # Persist shortlist/notes into session
-            for _, r in edited[["company_number", "shortlist", "notes"]].iterrows():
-                st.session_state.shortlist_map[str(r["company_number"])] = bool(r["shortlist"])
-                st.session_state.notes_map[str(r["company_number"])] = str(r["notes"])
-
-            # Include shortlist/notes in the CSV export (using edited table)
-            st.download_button(
-                "Download outreach CSV",
-                data=edited.to_csv(index=False),
-                file_name="boomer_radar_targets.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-
-        with t2:
-            if {"lat", "lon"}.issubset(df.columns) and df["lat"].notna().any():
-                dmap = df.dropna(subset=["lat", "lon"]).copy()
-                dmap["size"] = 400 + (dmap["boomer_score"].fillna(50) * 6)  # marker radius
-                layer = pdk.Layer(
-                    "ScatterplotLayer",
-                    data=dmap,
-                    get_position="[lon, lat]",
-                    get_radius="size",
-                    pickable=True,
+            if not rows:
+                st.info(
+                    "No companies found within the chosen radius. "
+                    "Try increasing the radius or removing the radius filter."
                 )
-                tooltip = {"html": "<b>{company_name}</b><br/>Score: {boomer_score}<br/>{postcode}"}
-                st.pydeck_chart(
-                    pdk.Deck(
-                        map_style="mapbox://styles/mapbox/light-v9",
-                        initial_view_state=pdk.ViewState(
-                            latitude=float(dmap["lat"].mean()),
-                            longitude=float(dmap["lon"].mean()),
-                            zoom=6,
-                        ),
-                        layers=[layer],
-                        tooltip=tooltip,
+            else:
+                df = pd.DataFrame(rows)
+
+                # Compute score
+                df["score"] = df.apply(lambda r: compute_score_row(r, float(radius_km)), axis=1)
+
+                # Basic KPIs
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    st.markdown(
+                        f'<div class="kpi"><small>Results</small><h3>{len(df):,}</h3></div>',
+                        unsafe_allow_html=True,
                     )
+                with c2:
+                    avg_score = df["score"].mean() if not df.empty else 0
+                    st.markdown(
+                        f'<div class="kpi"><small>Avg score</small><h3>{avg_score:.1f}</h3></div>',
+                        unsafe_allow_html=True,
+                    )
+                with c3:
+                    avg_years = df["years_trading"].mean() if "years_trading" in df.columns else 0
+                    st.markdown(
+                        f'<div class="kpi"><small>Avg years</small><h3>{avg_years:.1f}</h3></div>',
+                        unsafe_allow_html=True,
+                    )
+                with c4:
+                    avg_age = df["avg_director_age"].mean() if "avg_director_age" in df.columns else 0
+                    st.markdown(
+                        f'<div class="kpi"><small>Avg dir age</small><h3>{avg_age:.1f}</h3></div>',
+                        unsafe_allow_html=True,
+                    )
+
+                # Outreach links
+                email_subjects, email_bodies, email_links = [], [], []
+                for _, r in df.iterrows():
+                    ch_link = r.get("ch_link", "")
+                    company_name = r.get("company_name", "")
+                    subj = f"Succession / exit option for {company_name}"
+                    body = (
+                        f"Hi,\n\nI run an acquisition company focused on long-established, well-run firms "
+                        f"where the owner is considering retirement. Would you be open to a confidential chat?\n\n"
+                        f"Companies House profile: {ch_link}\n\n"
+                        f"Best regards,\n"
+                    )
+                    email_subjects.append(subj)
+                    email_bodies.append(body)
+                    email_links.append(
+                        "mailto:?subject=" + ul.quote(subj) + "&body=" + ul.quote(body)
+                    )
+
+                df["email_subject"] = email_subjects
+                df["email_body"] = email_bodies
+                df["email_link"] = email_links
+
+                # Columns to show
+                view_cols = [
+                    "score",
+                    "company_name",
+                    "company_number",
+                    "years_trading",
+                    "avg_director_age",
+                    "director_ages",
+                    "postcode",
+                    "distance_km",
+                    "last_accounts_made_up_to",
+                    "months_since_accounts",
+                    "accounts_overdue",
+                    "confirmation_last_made_up_to",
+                    "months_since_confirmation",
+                    "confirmation_overdue",
+                    "sic_codes",
+                    "ch_link",
+                    "google",
+                    "email_link",
+                ]
+                for c in view_cols:
+                    if c not in df.columns:
+                        df[c] = None
+
+                st.subheader("Results")
+                st.dataframe(
+                    df[view_cols].sort_values("score", ascending=False),
+                    use_container_width=True,
                 )
-            else:
-                st.info("No coordinates yet. Use the Radius filter or run without radius to geocode all.")
 
-        with t3:
-            st.markdown(
-                """
-**Filters included**
+                # CSV export
+                st.subheader("Export")
+                st.download_button(
+                    "Download results CSV",
+                    data=df[view_cols + ["email_subject", "email_body"]].to_csv(index=False),
+                    file_name="boomer_radar_results.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
 
-- Accounts: `last_accounts.made_up_to` (months since) + overdue flag  
-- Confirmation: `confirmation_statement.last_made_up_to` (months since) + overdue flag  
-- Risk flags: insolvency history, undeliverable office address, office in dispute  
-- Outstanding charges: optional count from charges endpoint (with max allowed)  
-
-**Shortlist & Notes**  
-Use the ⭐ column to shortlist and jot notes; included in the CSV.
-"""
-            )
+else:
+    st.info("Set your filters in the sidebar and click **Run search** to begin.")
