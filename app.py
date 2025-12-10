@@ -1,4 +1,4 @@
-# app.py — Boomer Radar (simplified v1)
+# app.py — Boomer Radar (simplified v1 + directors column)
 # Focused on: older owners, long trading history, local radius, curated SICs
 # Simple UI, clean results, score column, CSV export.
 
@@ -246,13 +246,13 @@ if run_search:
                 max_companies=200,
             )
 
-        # Radius filtering / geocoding
         if not rows:
             st.info(
                 "No companies matched your filters on this page. "
-                "Try lowering director age, reducing years trading, widening radius or trying a different page."
+                "Try lowering director age, reducing years trading, widening radius, or trying a different page."
             )
         else:
+            # Radius filtering / geocoding
             if centre_pc.strip():
                 with st.spinner("Filtering by radius…"):
                     rows = filter_by_radius(rows, centre_pc.strip(), float(radius_km))
@@ -261,8 +261,8 @@ if run_search:
 
             if not rows:
                 st.info(
-                    "No companies found within the chosen radius. "
-                    "Try increasing the radius or removing the radius filter."
+                    "Companies were found on Companies House, but none within this radius.\n\n"
+                    "Try increasing the radius (e.g. 40–50km) or temporarily clearing the postcode."
                 )
             else:
                 df = pd.DataFrame(rows)
@@ -274,25 +274,25 @@ if run_search:
                 c1, c2, c3, c4 = st.columns(4)
                 with c1:
                     st.markdown(
-                        f'<div class="kpi"><small>Results</small><h3>{len(df):,}</h3></div>',
+                        f'<div class="kpi"><small>RESULTS</small><h3>{len(df):,}</h3></div>',
                         unsafe_allow_html=True,
                     )
                 with c2:
                     avg_score = df["score"].mean() if not df.empty else 0
                     st.markdown(
-                        f'<div class="kpi"><small>Avg score</small><h3>{avg_score:.1f}</h3></div>',
+                        f'<div class="kpi"><small>AVG SCORE</small><h3>{avg_score:.1f}</h3></div>',
                         unsafe_allow_html=True,
                     )
                 with c3:
                     avg_years = df["years_trading"].mean() if "years_trading" in df.columns else 0
                     st.markdown(
-                        f'<div class="kpi"><small>Avg years</small><h3>{avg_years:.1f}</h3></div>',
+                        f'<div class="kpi"><small>AVG YEARS</small><h3>{avg_years:.1f}</h3></div>',
                         unsafe_allow_html=True,
                     )
                 with c4:
                     avg_age = df["avg_director_age"].mean() if "avg_director_age" in df.columns else 0
                     st.markdown(
-                        f'<div class="kpi"><small>Avg dir age</small><h3>{avg_age:.1f}</h3></div>',
+                        f'<div class="kpi"><small>AVG DIR AGE</small><h3>{avg_age:.1f}</h3></div>',
                         unsafe_allow_html=True,
                     )
 
@@ -318,13 +318,14 @@ if run_search:
                 df["email_body"] = email_bodies
                 df["email_link"] = email_links
 
-                # Columns to show
+                # Columns to show (now includes active_directors)
                 view_cols = [
                     "score",
                     "company_name",
                     "company_number",
                     "years_trading",
                     "avg_director_age",
+                    "active_directors",
                     "director_ages",
                     "postcode",
                     "distance_km",
