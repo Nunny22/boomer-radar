@@ -419,4 +419,3 @@ if run_search:
 
 else:
     st.info("Set your filters in the sidebar and click **Run search** to begin.")
-
