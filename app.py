@@ -1,6 +1,6 @@
-# app.py — Boomer Radar (simplified v1 + directors column + safe CH error handling)
+# app.py — Boomer Radar (simplified v1 + directors column + safe CH error handling + master CSV merge)
 # Focused on: older owners, long trading history, local radius, curated SICs
-# Simple UI, clean results, score column, CSV export.
+# Simple UI, clean results, score column, CSV export, optional master CSV auto-merge.
 
 import math
 import urllib.parse as ul
@@ -360,15 +360,63 @@ if run_search:
                     use_container_width=True,
                 )
 
-                # CSV export
+                # ----------------------------
+                # Master CSV upload + merge
+                # ----------------------------
+                st.subheader("Master CSV (optional)")
+
+                master_file = st.file_uploader(
+                    "Upload existing master CSV to auto-merge with these results (optional)",
+                    type=["csv"],
+                )
+
+                master_df = None
+                if master_file is not None:
+                    try:
+                        master_df = pd.read_csv(master_file)
+                        st.caption(f"Loaded master file with {len(master_df):,} rows.")
+                    except Exception:
+                        st.warning(
+                            "Couldn't read that CSV. "
+                            "Check the file and try again, or just download this run's results."
+                        )
+                        master_df = None
+
                 st.subheader("Export")
+
+                # Download just this run's results
+                this_run_csv = df[view_cols + ["email_subject", "email_body"]].to_csv(index=False)
                 st.download_button(
-                    "Download results CSV",
-                    data=df[view_cols + ["email_subject", "email_body"]].to_csv(index=False),
+                    "Download this run's results CSV",
+                    data=this_run_csv,
                     file_name="boomer_radar_results.csv",
                     mime="text/csv",
                     use_container_width=True,
                 )
 
+                # If master CSV uploaded, offer merged export
+                if master_df is not None:
+                    # Ensure all columns are present in both for concat (outer-style)
+                    new_df = df[view_cols + ["email_subject", "email_body"]]
+
+                    # Concatenate and drop duplicates by company_number if present
+                    merged = pd.concat([master_df, new_df], ignore_index=True)
+
+                    if "company_number" in merged.columns:
+                        merged = merged.drop_duplicates(subset="company_number")
+                    else:
+                        merged = merged.drop_duplicates()
+
+                    merged_csv = merged.to_csv(index=False)
+
+                    st.download_button(
+                        "Download UPDATED master CSV (merged + de-duplicated)",
+                        data=merged_csv,
+                        file_name="boomer_radar_master.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+
 else:
     st.info("Set your filters in the sidebar and click **Run search** to begin.")
+
