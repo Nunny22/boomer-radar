@@ -1,6 +1,6 @@
-# app.py — Boomer Radar (simplified v1 + directors column + safe CH error handling + master CSV merge)
-# Focused on: older owners, long trading history, local radius, curated SICs
-# Simple UI, clean results, score column, CSV export, optional master CSV auto-merge.
+# app.py — Boomer Radar
+# Simplified v1 + directors column + safe CH error handling + master CSV merge (fixed uploader)
+# Focused on: older owners, long trading history, local radius, curated SICs.
 
 import math
 import urllib.parse as ul
@@ -119,6 +119,13 @@ st.markdown(
 )
 
 # ---------------------------------------------------------------------------
+# Session state for master CSV
+# ---------------------------------------------------------------------------
+
+if "master_df" not in st.session_state:
+    st.session_state.master_df = None
+
+# ---------------------------------------------------------------------------
 # Curated SIC groups (boring, stable, non-AI / physical work)
 # ---------------------------------------------------------------------------
 
@@ -187,6 +194,29 @@ with st.sidebar:
     )
 
     run_search = st.button("Run search", use_container_width=True)
+
+# ---------------------------------------------------------------------------
+# Master CSV upload (always visible)
+# ---------------------------------------------------------------------------
+
+st.subheader("Master CSV (optional)")
+
+uploaded_master = st.file_uploader(
+    "Upload existing master CSV to auto-merge with new results (optional)",
+    type=["csv"],
+)
+
+if uploaded_master is not None:
+    try:
+        st.session_state.master_df = pd.read_csv(uploaded_master)
+        st.caption(f"Loaded master file with {len(st.session_state.master_df):,} rows.")
+    except Exception:
+        st.warning("Couldn't read that CSV. Check the file and try again.")
+else:
+    if st.session_state.master_df is not None:
+        st.caption(f"Using previously loaded master file with {len(st.session_state.master_df):,} rows.")
+    else:
+        st.caption("No master CSV loaded yet. You can still run searches and download this run's results.")
 
 # ---------------------------------------------------------------------------
 # Helper: scoring for prioritisation (0–100)
@@ -361,27 +391,8 @@ if run_search:
                 )
 
                 # ----------------------------
-                # Master CSV upload + merge
+                # Export & master CSV merge
                 # ----------------------------
-                st.subheader("Master CSV (optional)")
-
-                master_file = st.file_uploader(
-                    "Upload existing master CSV to auto-merge with these results (optional)",
-                    type=["csv"],
-                )
-
-                master_df = None
-                if master_file is not None:
-                    try:
-                        master_df = pd.read_csv(master_file)
-                        st.caption(f"Loaded master file with {len(master_df):,} rows.")
-                    except Exception:
-                        st.warning(
-                            "Couldn't read that CSV. "
-                            "Check the file and try again, or just download this run's results."
-                        )
-                        master_df = None
-
                 st.subheader("Export")
 
                 # Download just this run's results
@@ -394,13 +405,14 @@ if run_search:
                     use_container_width=True,
                 )
 
-                # If master CSV uploaded, offer merged export
-                if master_df is not None:
-                    # Ensure all columns are present in both for concat (outer-style)
+                # If a master CSV is loaded in session, offer merged export
+                if st.session_state.master_df is not None:
                     new_df = df[view_cols + ["email_subject", "email_body"]]
 
-                    # Concatenate and drop duplicates by company_number if present
-                    merged = pd.concat([master_df, new_df], ignore_index=True)
+                    merged = pd.concat(
+                        [st.session_state.master_df, new_df],
+                        ignore_index=True,
+                    )
 
                     if "company_number" in merged.columns:
                         merged = merged.drop_duplicates(subset="company_number")
@@ -415,6 +427,10 @@ if run_search:
                         file_name="boomer_radar_master.csv",
                         mime="text/csv",
                         use_container_width=True,
+                    )
+                else:
+                    st.caption(
+                        "Upload a master CSV above if you want to auto-merge these results into your long-term list."
                     )
 
 else:
