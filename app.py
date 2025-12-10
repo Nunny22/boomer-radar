@@ -1,4 +1,4 @@
-# app.py — Boomer Radar (simplified v1 + directors column)
+# app.py — Boomer Radar (simplified v1 + directors column + safe CH error handling)
 # Focused on: older owners, long trading history, local radius, curated SICs
 # Simple UI, clean results, score column, CSV export.
 
@@ -235,16 +235,26 @@ if run_search:
     if not selected_sics:
         st.warning("Please keep at least one SIC group selected.")
     else:
+        # -----------------------------
+        # Call Companies House safely
+        # -----------------------------
         with st.spinner("Querying Companies House…"):
-            rows = find_targets(
-                selected_sics,
-                min_age=int(min_age),
-                max_directors=int(max_directors),
-                min_years_trading=int(min_years_trading),
-                size=100,
-                start_page=int(page_number),
-                max_companies=200,
-            )
+            try:
+                rows = find_targets(
+                    selected_sics,
+                    min_age=int(min_age),
+                    max_directors=int(max_directors),
+                    min_years_trading=int(min_years_trading),
+                    size=100,
+                    start_page=int(page_number),
+                    max_companies=200,
+                )
+            except Exception:
+                st.warning(
+                    "Companies House didn't return results for this SIC + page + filter combination. "
+                    "Try a different page number, or slightly widen your filters (radius / years / age)."
+                )
+                rows = []
 
         if not rows:
             st.info(
@@ -318,7 +328,7 @@ if run_search:
                 df["email_body"] = email_bodies
                 df["email_link"] = email_links
 
-                # Columns to show (now includes active_directors)
+                # Columns to show (includes active_directors)
                 view_cols = [
                     "score",
                     "company_name",
